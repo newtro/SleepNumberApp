@@ -2,41 +2,24 @@ import XCTest
 @testable import BedKit
 
 final class ModelTests: XCTestCase {
-    func testSideMappingDefaultsAndSwap() {
+    func testSideMappingFollowsTheApp() {
+        // Official app: right = 0, left = 1.
         let normal = SideMapping()
-        XCTAssertEqual(normal.mcrSide(for: .left), .zero)
-        XCTAssertEqual(normal.mcrSide(for: .right), .one)
-        XCTAssertEqual(normal.side(forMCR: .zero), .left)
+        XCTAssertEqual(normal.mcrSide(for: .right), .zero)
+        XCTAssertEqual(normal.mcrSide(for: .left), .one)
+        XCTAssertEqual(normal.side(forMCR: .zero), .right)
         XCTAssertEqual(normal.fuzionSide(for: .left), .left)
 
         let swapped = SideMapping(swapped: true)
-        XCTAssertEqual(swapped.mcrSide(for: .left), .one)
-        XCTAssertEqual(swapped.mcrSide(for: .right), .zero)
-        XCTAssertEqual(swapped.side(forMCR: .zero), .right)
+        XCTAssertEqual(swapped.mcrSide(for: .left), .zero)
+        XCTAssertEqual(swapped.mcrSide(for: .right), .one)
+        XCTAssertEqual(swapped.side(forMCR: .zero), .left)
         XCTAssertEqual(swapped.fuzionSide(for: .left), .right)
     }
 
-    func testMotionPlannerIsBoundedAndIncremental() {
-        let planner = MotionPlanner(step: 10, retargetMargin: 3)
-        XCTAssertEqual(planner.nextTarget(from: 40, direction: .up), 50)
-        XCTAssertEqual(planner.nextTarget(from: 95, direction: .up), 100)
-        XCTAssertNil(planner.nextTarget(from: 100, direction: .up))
-        XCTAssertEqual(planner.nextTarget(from: 40, direction: .down), 30)
-        XCTAssertEqual(planner.nextTarget(from: 4, direction: .down), 0)
-        XCTAssertNil(planner.nextTarget(from: 0, direction: .down))
-        // Never more than one step away from the measured position, for every start point.
-        for start in 0...100 {
-            for direction in [MoveDirection.up, .down] {
-                if let target = planner.nextTarget(from: start, direction: direction) {
-                    XCTAssertLessThanOrEqual(abs(target - start), 10)
-                    XCTAssertTrue((0...100).contains(target))
-                }
-            }
-        }
-        XCTAssertFalse(planner.shouldRetarget(current: 45, target: 50, direction: .up))
-        XCTAssertTrue(planner.shouldRetarget(current: 47, target: 50, direction: .up))
-        XCTAssertTrue(planner.shouldRetarget(current: 33, target: 30, direction: .down))
-        XCTAssertFalse(planner.shouldRetarget(current: 34, target: 30, direction: .down))
+    func testHoldTargetsMatchTheApp() {
+        XCTAssertEqual(MoveDirection.up.holdTarget, 100)
+        XCTAssertEqual(MoveDirection.down.holdTarget, 0)
     }
 
     func testProtocolDetectionFromServices() {

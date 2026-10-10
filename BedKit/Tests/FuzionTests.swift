@@ -12,14 +12,18 @@ final class FuzionFrameTests: XCTestCase {
         XCTAssertEqual(FuzionCommand.haltAllActuators().frame.hexString,
                        "66 55 7a 49 6f 4e 13 00 00 00 41 43 48 41 20 42 8f 7b af")
         XCTAssertEqual(FuzionCommand.setPreset(.left, preset: .flat).frame.hexString,
-                       "66 55 7a 49 6f 4e 1e 00 00 00 41 43 53 50 20 6c 65 66 74 20 66 6c 61 74 20 30 e9 32 f2 41")
+                       "66 55 7a 49 6f 4e 1c 00 00 00 41 53 54 50 20 6c 65 66 74 20 66 6c 61 74 4c 86 07 51")
+        XCTAssertEqual(try FuzionCommand.microAdjust(.right, actuator: .head, target: 100).frame.hexString,
+                       "66 55 7a 49 6f 4e 21 00 00 00 41 53 54 4d 20 72 69 67 68 74 20 68 65 61 64 20 31 30 30 11 f7 95 64")
     }
 
     func testCommandText() throws {
         XCTAssertEqual(FuzionCommand.haltAllActuators().text, "ACHA ")
         XCTAssertEqual(FuzionCommand.systemConfiguration().text, "SYCG ")
-        XCTAssertEqual(FuzionCommand.setPreset(.right, preset: .zeroG).text, "ACSP right zero_g 0")
-        XCTAssertEqual(FuzionCommand.setPreset(.left, preset: .watchTV).text, "ACSP left watch_tv 0")
+        XCTAssertEqual(FuzionCommand.setPreset(.right, preset: .zeroG).text, "ASTP right zero_g")
+        XCTAssertEqual(FuzionCommand.setPreset(.left, preset: .watchTV).text, "ASTP left watch_tv")
+        XCTAssertEqual(try FuzionCommand.microAdjust(.left, actuator: .foot, target: 0).text, "ASTM left foot 0")
+        XCTAssertEqual(FuzionCommand.actuatorMovementStatus().text, "ACTM ")
         XCTAssertEqual(try FuzionCommand.setActuatorTarget(.right, actuator: .head, position: 40).text, "ACTS right head 40")
         XCTAssertEqual(try FuzionCommand.startSleepNumberAdjustment(.left, value: 45).text, "PSNS left 45")
         XCTAssertEqual(FuzionCommand.sleepNumberControls(.right).text, "SNCG right")
@@ -33,6 +37,7 @@ final class FuzionFrameTests: XCTestCase {
         XCTAssertThrowsError(try FuzionCommand.setActuatorTarget(.left, actuator: .head, position: 101))
         XCTAssertThrowsError(try FuzionCommand.setActuatorTarget(.left, actuator: .head, position: -1))
         XCTAssertThrowsError(try FuzionCommand.setUnderBedLight(level: .low, timerMinutes: 181))
+        XCTAssertThrowsError(try FuzionCommand.microAdjust(.left, actuator: .head, target: 101))
     }
 
     func testDecodeRoundTripAndRejection() throws {
@@ -86,6 +91,16 @@ final class FuzionFrameTests: XCTestCase {
         XCTAssertThrowsError(try FuzionSleepNumberControls.parse(["1", "30"], command: command))
     }
 
+    func testMovementStatusParsing() throws {
+        let status = try FuzionMovementStatus.parse(["0", "1", "0", "0"])
+        XCTAssertTrue(status.rightFoot)
+        XCTAssertTrue(status.any)
+        XCTAssertTrue(status.moving(.right, .foot))
+        XCTAssertFalse(status.moving(.left, .head))
+        XCTAssertThrowsError(try FuzionMovementStatus.parse(["0", "1"]))
+        XCTAssertThrowsError(try FuzionMovementStatus.parse(["0", "1", "2", "0"]))
+    }
+
     func testSystemConfigurationParsing() throws {
         let tokens = ["dual", "yes", "yes", "yes", "no", "none", "yes", "yes", "yes", "yes",
                       "yes", "yes", "yes", "yes", "no", "no"]
@@ -94,6 +109,7 @@ final class FuzionFrameTests: XCTestCase {
         XCTAssertTrue(config.hasUnderBedLight)
         XCTAssertTrue(config.supports(.zeroG))
         XCTAssertFalse(config.supports(.watchTV))
+        XCTAssertTrue(config.isSplit)
         XCTAssertThrowsError(try FuzionSystemConfiguration.parse(Array(tokens.prefix(15))))
     }
 
@@ -167,6 +183,21 @@ final class FuzionSessionTests: XCTestCase {
         let controls = try await session.sleepNumberControls(.left)
         XCTAssertEqual(controls.user, 45)
         XCTAssertEqual(link.writes.last?.data, FuzionCommand.sleepNumberControls(.left).frame)
+    }
+
+    func testUrgentHaltDropsQueuedCommands() async throws {
+        link.readQueue[.fuzionAuth] = [sessionID]
+        try await session.authenticate()
+        let before = session.stopGeneration
+        try await session.sendUrgent(.haltAllActuators())
+        XCTAssertEqual(session.stopGeneration, before + 1)
+        do {
+            try await session.send(.setPreset(.left, preset: .zeroG), generation: before)
+            XCTFail()
+        } catch {
+            XCTAssertEqual(error as? BedError, .cancelled)
+        }
+        XCTAssertEqual(link.writes.count, 1)
     }
 
     func testCommandTimesOutWithoutHint() async throws {

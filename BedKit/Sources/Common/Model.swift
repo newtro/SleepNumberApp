@@ -52,9 +52,8 @@ public enum BedSide: String, Codable, Sendable, CaseIterable, Identifiable {
 
 /// Maps the app's sides to each protocol's wire sides.
 ///
-/// MCR: side 0 is the sleeper's left by default (evidence: BedRemote, which was driven on a
-/// real bed; see docs/PROTOCOL-NOTES.md for the conflicting reports). `swapped` flips it for
-/// beds that disagree, so the user can fix it from Settings without a rebuild.
+/// MCR: right = 0, left = 1 (`Bed.Side.toDeviceValue()` in the official app). `swapped` flips
+/// it, so a bed or a sleeper whose idea of "left" differs can be fixed from Settings.
 public struct SideMapping: Equatable, Sendable, Codable {
     public var swapped: Bool
 
@@ -62,8 +61,8 @@ public struct SideMapping: Equatable, Sendable, Codable {
 
     public func mcrSide(for side: BedSide) -> MCRWireSide {
         switch (side, swapped) {
-        case (.left, false), (.right, true): return .zero
-        case (.right, false), (.left, true): return .one
+        case (.right, false), (.left, true): return .zero
+        case (.left, false), (.right, true): return .one
         }
     }
 
@@ -146,42 +145,9 @@ public enum SleepNumber {
     }
 }
 
-public enum MoveDirection: Sendable { case up, down }
+public enum MoveDirection: Sendable {
+    case up, down
 
-/// Computes the bounded, incremental targets used while a head/foot button is held.
-///
-/// Instead of commanding the motor to an extreme (0 or 100) and relying on a stop frame to
-/// arrive, each command moves at most `step` points from the current measured position. If the
-/// app, phone or radio dies mid-hold, the bed stops by itself within one step.
-public struct MotionPlanner: Sendable, Equatable {
-    public var step: Int
-    /// How close to the current target the axis must get before the next increment is sent.
-    public var retargetMargin: Int
-
-    public init(step: Int = 10, retargetMargin: Int = 3) {
-        precondition(step > 0 && step <= 25, "step must be 1...25")
-        self.step = step
-        self.retargetMargin = retargetMargin
-    }
-
-    /// The next target from `current`, or nil if the axis is already at its limit.
-    public func nextTarget(from current: Int, direction: MoveDirection) -> Int? {
-        let position = min(max(current, 0), 100)
-        switch direction {
-        case .up:
-            guard position < 100 else { return nil }
-            return min(100, position + step)
-        case .down:
-            guard position > 0 else { return nil }
-            return max(0, position - step)
-        }
-    }
-
-    /// True when the axis has (nearly) reached `target` and a fresh increment should be sent.
-    public func shouldRetarget(current: Int, target: Int, direction: MoveDirection) -> Bool {
-        switch direction {
-        case .up: return current >= target - retargetMargin
-        case .down: return current <= target + retargetMargin
-        }
-    }
+    /// The official app's hold-to-move target: 100 for up, 0 for down.
+    public var holdTarget: Int { self == .up ? 100 : 0 }
 }

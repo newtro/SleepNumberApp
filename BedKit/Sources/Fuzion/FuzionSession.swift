@@ -28,6 +28,8 @@ public final class FuzionSession {
     private var hintArrived = false
     private var awaitingHint = false
     private var nextID: UInt64 = 0
+    /// Incremented by every urgent stop; commands queued before it are abandoned.
+    public private(set) var stopGeneration: UInt64 = 0
 
     public init(link: GATTLink, timing: Timing = Timing(), log: @escaping FrameLogger) {
         self.link = link
@@ -97,10 +99,15 @@ public final class FuzionSession {
 
     /// Sends one command and returns its PASS argument tokens.
     @discardableResult
-    public func send(_ command: FuzionCommand) async throws -> [String] {
+    public func send(_ command: FuzionCommand, generation: UInt64? = nil) async throws -> [String] {
+        let generation = generation ?? stopGeneration
         await mutex.lock()
         defer { mutex.unlock() }
         try Task.checkCancellation()
+        guard generation == stopGeneration else {
+            log(FrameEvent(.info, channel: "BamKey", text: "dropped \(command.key): STOP was pressed after it was queued"))
+            throw BedError.cancelled
+        }
         guard let link, sessionID != nil else { throw BedError.notConnected }
 
         hintArrived = false
@@ -125,6 +132,7 @@ public final class FuzionSession {
     /// Writes immediately, bypassing the queue and without reading a reply (STOP path).
     public func sendUrgent(_ command: FuzionCommand) async throws {
         guard let link, sessionID != nil else { throw BedError.notConnected }
+        stopGeneration &+= 1
         log(FrameEvent(.tx, channel: "BamKey", bytes: command.frame, text: "URGENT \(command.text)"))
         try await link.write(command.frame, to: .fuzionBamKey)
     }
@@ -174,6 +182,10 @@ public final class FuzionSession {
         let tokens = try await send(command)
         guard tokens.count == 1 else { throw BedError.malformedResponse("ACTG returned \(tokens)") }
         return min(max(try FuzionResponse.int(tokens, at: 0, for: command), 0), 100)
+    }
+
+    public func movementStatus() async throws -> FuzionMovementStatus {
+        try FuzionMovementStatus.parse(try await send(.actuatorMovementStatus()))
     }
 
     public func underBedLight() async throws -> (level: FuzionLightLevel, timer: Int) {

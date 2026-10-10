@@ -50,9 +50,17 @@ public struct FuzionCommand: Equatable, Sendable, CustomStringConvertible {
     /// PSNI: interrupt a running firmness adjustment.
     public static func interruptSleepNumberAdjustment() -> FuzionCommand { FuzionCommand("PSNI") }
 
-    /// ACSP side preset timer: recall a preset (timer 0 = no timer).
+    /// ASTP side preset: recall a preset (`SetFuzionFlexFitPresetCall`, the app's preset button).
     public static func setPreset(_ side: FuzionSide, preset: BedPreset) -> FuzionCommand {
-        FuzionCommand("ACSP", [side.rawValue, preset.fuzionToken, "0"])
+        FuzionCommand("ASTP", [side.rawValue, preset.fuzionToken])
+    }
+
+    /// ASTM side actuator target: micro-adjust used for hold-to-move (target 100 up / 0 down).
+    public static func microAdjust(_ side: FuzionSide, actuator: FuzionActuator, target: Int) throws -> FuzionCommand {
+        guard (0...100).contains(target) else {
+            throw BedError.invalidArgument("\(actuator.rawValue) target \(target) must be 0...100")
+        }
+        return FuzionCommand("ASTM", [side.rawValue, actuator.rawValue, String(target)])
     }
 
     /// ACTS side actuator position: move one actuator to an absolute 0...100 target.
@@ -121,6 +129,32 @@ public enum FuzionResponse {
     }
 }
 
+/// ACTM reply: moving flags in the fixed order right head, right foot, left head, left foot.
+public struct FuzionMovementStatus: Equatable, Sendable {
+    public var rightHead: Bool
+    public var rightFoot: Bool
+    public var leftHead: Bool
+    public var leftFoot: Bool
+    public var any: Bool { rightHead || rightFoot || leftHead || leftFoot }
+
+    public func moving(_ side: FuzionSide, _ actuator: FuzionActuator) -> Bool {
+        switch (side, actuator) {
+        case (.right, .head): return rightHead
+        case (.right, .foot): return rightFoot
+        case (.left, .head): return leftHead
+        case (.left, .foot): return leftFoot
+        }
+    }
+
+    public static func parse(_ tokens: [String]) throws -> FuzionMovementStatus {
+        guard tokens.count == 4, tokens.allSatisfy({ $0 == "0" || $0 == "1" }) else {
+            throw BedError.malformedResponse("ACTM returned \(tokens)")
+        }
+        return FuzionMovementStatus(rightHead: tokens[0] == "1", rightFoot: tokens[1] == "1",
+                                    leftHead: tokens[2] == "1", leftFoot: tokens[3] == "1")
+    }
+}
+
 /// SNCG reply.
 public struct FuzionSleepNumberControls: Equatable, Sendable {
     public var adjusting: Bool
@@ -154,6 +188,11 @@ public struct FuzionSystemConfiguration: Equatable, Sendable {
 
     public var isSingleChamber: Bool { fields["chamber_type"] == "single" }
     public var hasUnderBedLight: Bool { fields["underbed_light"] != "no" }
+    /// Split means both sides report at least one actuator.
+    public var isSplit: Bool {
+        (fields["left_head_actuator"] == "yes" || fields["left_foot_actuator"] == "yes")
+            && (fields["right_head_actuator"] == "yes" || fields["right_foot_actuator"] == "yes")
+    }
 
     public func supports(_ preset: BedPreset) -> Bool {
         let key: String

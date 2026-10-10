@@ -20,28 +20,36 @@ public enum MCRChecksum {
     }
 }
 
-/// One MCR frame:
-/// `16 16 | cmd tgt_hi tgt_lo sub_hi sub_lo status echo_hi echo_lo func (side<<4|len) | payload | crc_hi crc_lo`
+/// One MCR frame (layout per the official app, `ne.r`):
+/// `16 16 | node src_hi src_lo dst_hi dst_lo node src_hi src_lo cmd (sub<<4|len) | payload | ck_hi ck_lo`
+/// Requests carry our client address in src (bytes 1-2 and 6-7) and the bed's in dst (3-4).
+/// Replies swap them: the bed's address in 1-2 and 6-7, ours in 3-4.
 public struct MCRFrame: Equatable, Sendable, CustomStringConvertible {
     public static let sync: [UInt8] = [0x16, 0x16]
     public static let headerLength = 10
     public static let overhead = 14  // sync + header + checksum
     public static let maxPayload = 15
 
+    /// Header byte 0: node class (requests use the node with low nibble 2, e.g. 0x42).
     public let command: UInt8
-    public let target: UInt16
-    public let subAddress: UInt16
+    /// Header bytes 1-2.
+    public let source: UInt16
+    /// Header bytes 3-4.
+    public let destination: UInt16
+    /// Header byte 5: node class, repeated.
     public let status: UInt8
-    public let echo: UInt16
-    /// Raw function byte, including the 0x80 response bit.
+    /// Header bytes 6-7: source address again.
+    public let sourceEcho: UInt16
+    /// Header byte 8: command, with 0x80 set on replies.
     public let function: UInt8
+    /// High nibble of header byte 9: side (right 0, left 1), outlet, or selector.
     public let side: UInt8
     public let payload: [UInt8]
 
     public var functionCode: UInt8 { function & 0x7F }
     public var isResponse: Bool { function & 0x80 != 0 }
 
-    public init(command: UInt8, target: UInt16 = 0, subAddress: UInt16, status: UInt8, echo: UInt16 = 0,
+    public init(command: UInt8, source: UInt16 = 0, destination: UInt16, status: UInt8, sourceEcho: UInt16 = 0,
                 function: UInt8, side: UInt8, payload: [UInt8] = []) throws {
         guard payload.count <= MCRFrame.maxPayload else {
             throw BedError.invalidArgument("MCR payload is \(payload.count) bytes; the limit is 15")
@@ -50,10 +58,10 @@ public struct MCRFrame: Equatable, Sendable, CustomStringConvertible {
             throw BedError.invalidArgument("MCR side selector \(side) does not fit in a nibble")
         }
         self.command = command
-        self.target = target
-        self.subAddress = subAddress
+        self.source = source
+        self.destination = destination
         self.status = status
-        self.echo = echo
+        self.sourceEcho = sourceEcho
         self.function = function
         self.side = side
         self.payload = payload
@@ -61,10 +69,10 @@ public struct MCRFrame: Equatable, Sendable, CustomStringConvertible {
 
     public var headerAndPayload: [UInt8] {
         [command,
-         UInt8(target >> 8), UInt8(target & 0xFF),
-         UInt8(subAddress >> 8), UInt8(subAddress & 0xFF),
+         UInt8(source >> 8), UInt8(source & 0xFF),
+         UInt8(destination >> 8), UInt8(destination & 0xFF),
          status,
-         UInt8(echo >> 8), UInt8(echo & 0xFF),
+         UInt8(sourceEcho >> 8), UInt8(sourceEcho & 0xFF),
          function,
          (side << 4) | UInt8(payload.count)] + payload
     }
@@ -88,10 +96,10 @@ public struct MCRFrame: Equatable, Sendable, CustomStringConvertible {
         let expected = UInt16(bytes[bytes.count - 2]) << 8 | UInt16(bytes[bytes.count - 1])
         guard MCRChecksum.compute(body) == expected else { throw BedError.malformedResponse("MCR checksum mismatch") }
         return try MCRFrame(command: body[0],
-                            target: UInt16(body[1]) << 8 | UInt16(body[2]),
-                            subAddress: UInt16(body[3]) << 8 | UInt16(body[4]),
+                            source: UInt16(body[1]) << 8 | UInt16(body[2]),
+                            destination: UInt16(body[3]) << 8 | UInt16(body[4]),
                             status: body[5],
-                            echo: UInt16(body[6]) << 8 | UInt16(body[7]),
+                            sourceEcho: UInt16(body[6]) << 8 | UInt16(body[7]),
                             function: body[8],
                             side: body[9] >> 4,
                             payload: Array(body[10..<(10 + length)]))
@@ -102,15 +110,16 @@ public struct MCRFrame: Equatable, Sendable, CustomStringConvertible {
         switch command & 0xF0 {
         case 0x00: kind = "pump"
         case 0x40: kind = "foundation"
+        case 0x30: kind = "senseAndDo"
         case 0x50: kind = "sleepExpert"
-        case 0x70: kind = "device"
+        case 0x70: kind = "proxy"
         case 0x90: kind = "outlet"
         default: kind = String(format: "node%02X", command)
         }
         let ascii = payload.allSatisfy { $0 >= 0x20 && $0 < 0x7F } && !payload.isEmpty
             ? " \"\(String(decoding: payload, as: UTF8.self))\"" : ""
-        return String(format: "%@ cmd=%02X func=%d%@ side=%d tgt=%04X sub=%04X echo=%04X",
-                      kind, command, functionCode, isResponse ? "(R)" : "", side, target, subAddress, echo)
+        return String(format: "%@ node=%02X cmd=0x%02X%@ sub=%d src=%04X dst=%04X",
+                      kind, command, functionCode, isResponse ? "(R)" : "", side, source, destination)
             + " [\(payload.hexString)]" + ascii
     }
 }

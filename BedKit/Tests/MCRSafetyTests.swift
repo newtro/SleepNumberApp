@@ -20,7 +20,7 @@ final class MCRSafetyTests: XCTestCase {
                         default: XCTAssertEqual(byte, 0xFF, "byte \(index) must be masked")
                         }
                     }
-                    let frame = try request.frame(subAddress: 0x32D3)
+                    let frame = try request.frame(client: 0xA1B2, bed: 0x32D3)
                     XCTAssertEqual(frame.encoded.count, 14 + 12)
                     XCTAssertEqual(frame.encoded[11], (side.rawValue << 4) | 12)
                     XCTAssertNoThrow(try MCRSafety.validateWireFrame(frame.encoded))
@@ -63,12 +63,12 @@ final class MCRSafetyTests: XCTestCase {
 
     func testWireValidatorCatchesHandCraftedFrames() throws {
         // A raw frame built around the public frame type is still caught before the write.
-        let raw = try MCRFrame(command: 0x42, subAddress: 0x32D3, status: 0x42, function: 17, side: 0, payload: [100, 0, 0, 0])
+        let raw = try MCRFrame(command: 0x42, destination: 0x32D3, status: 0x42, function: 17, side: 0, payload: [100, 0, 0, 0])
         XCTAssertThrowsError(try MCRSafety.validateWireFrame(raw.encoded))
-        let empty = try MCRFrame(command: 0x42, subAddress: 0x32D3, status: 0x42, function: 17, side: 1)
+        let empty = try MCRFrame(command: 0x42, destination: 0x32D3, status: 0x42, function: 17, side: 1)
         XCTAssertThrowsError(try MCRSafety.validateWireFrame(empty.encoded))
         // Replies (response bit set) and other functions pass.
-        let ack = try MCRFrame(command: 0x41, subAddress: 0x32D3, status: 0x41, function: 0x80 | 17, side: 0)
+        let ack = try MCRFrame(command: 0x41, destination: 0x32D3, status: 0x41, function: 0x80 | 17, side: 0)
         XCTAssertNoThrow(try MCRSafety.validateWireFrame(ack.encoded))
     }
 
@@ -76,23 +76,23 @@ final class MCRSafetyTests: XCTestCase {
     func testSessionRefusesToWriteUnsafeFrames() async throws {
         // The session validates wire bytes before every write; the fake link must never see a bad SET.
         let link = FakeLink()
-        let session = MCRSession(link: link, log: { _ in })
+        let session = MCRSession(link: link, clientID: Array(repeating: 9, count: 8), log: { _ in })
         link.onNotify = { session.handleNotification($0) }
         link.responder = { data, _ in
-            guard let frame = try? MCRFrame.decode(data) else { return [] }
+            let frame = try! MCRFrame.decode(data)
             if frame.functionCode == 0 {
-                return [try! MCRFrame(command: 1, target: 0x32D3, subAddress: 0, status: 1, echo: 0x32D3, function: 0x80, side: 0, payload: Array(repeating: 0, count: 8)).encoded]
+                return [Data(hex: "16 16 01 32 d3 00 00 01 32 d3 80 0a 01 02 03 04 05 06 07 08 a1 b2 29 44")!]
             }
-            return [try! MCRFrame(command: frame.command - 1, target: 0x32D3, subAddress: 0, status: frame.command - 1, echo: 0x32D3,
-                                  function: 0x80 | frame.functionCode, side: frame.side).encoded]
+            return [try! MCRFrame(command: frame.command - 1, source: 0x32D3, destination: 0xA1B2, status: frame.command - 1,
+                                  sourceEcho: 0x32D3, function: 0x80 | frame.functionCode, side: frame.side).encoded]
         }
         try await session.performBind()
-        try await session.setFoundationTarget(side: .one, axis: .head, position: 40)
-        let writes = link.writes
-        for write in writes {
+        try await session.setFoundationTarget(side: .one, axis: .head, position: 100)
+        for write in link.writes {
             XCTAssertNoThrow(try MCRSafety.validateWireFrame(write.data))
         }
-        XCTAssertEqual(writes.last?.data.hexString,
-                       try MCRCommands.setFoundationTarget(side: .one, axis: .head, position: 40).frame(subAddress: 0x32D3).encoded.hexString)
+        XCTAssertEqual(link.writes.last?.data.hexString,
+                       try MCRCommands.setFoundationTarget(side: .one, axis: .head, position: 100)
+                           .frame(client: 0xA1B2, bed: 0x32D3).encoded.hexString)
     }
 }
