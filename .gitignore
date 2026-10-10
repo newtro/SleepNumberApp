@@ -1,0 +1,7 @@
+apk/
+*.apk
+build/
+DerivedData/
+.DS_Store
+xcuserdata/
+*.xcodeproj/

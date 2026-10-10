@@ -1,0 +1,81 @@
+name: BedControl
+options:
+  bundleIdPrefix: ai.johnnycode
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: false
+
+settings:
+  base:
+    DEVELOPMENT_TEAM: 232A77467G
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+
+targets:
+  BedKit:
+    type: framework
+    platform: iOS
+    sources:
+      - path: BedKit/Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.johnnycode.bedcontrol.BedKit
+        GENERATE_INFOPLIST_FILE: YES
+        SKIP_INSTALL: YES
+        DEFINES_MODULE: YES
+        APPLICATION_EXTENSION_API_ONLY: YES
+
+  BedKitTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: BedKit/Tests
+    dependencies:
+      - target: BedKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.johnnycode.bedcontrol.BedKitTests
+        GENERATE_INFOPLIST_FILE: YES
+
+  BedControl:
+    type: application
+    platform: iOS
+    sources:
+      - path: BedControl
+    dependencies:
+      - target: BedKit
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.johnnycode.bedcontrol
+        PRODUCT_NAME: BedControl
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Bed Control
+        INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: "Bed Control uses Bluetooth to talk directly to your Sleep Number bed: adjusting firmness, position, presets and the under-bed light."
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        TARGETED_DEVICE_FAMILY: "1,2"
+
+schemes:
+  BedControl:
+    build:
+      targets:
+        BedControl: all
+        BedKitTests: [test]
+    test:
+      targets:
+        - BedKitTests
+  BedKitTests:
+    build:
+      targets:
+        BedKitTests: all
+    test:
+      targets:
+        - BedKitTests
