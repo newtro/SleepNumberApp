@@ -2,6 +2,7 @@ import BedKit
 import CoreBluetooth
 import Foundation
 import Observation
+import UIKit
 
 /// App state and behaviour: connection policy, protocol drivers, polling, press-and-hold
 /// movement, the one-side-at-a-time firmness queue, and STOP.
@@ -34,16 +35,17 @@ final class BedController {
     private(set) var savedBed: SavedBed?
     private(set) var protocolKind: BedProtocol?
     private(set) var firmness: [BedSide: Int] = [:]
-    private(set) var pumping: [BedSide: Bool] = [:]
+    private(set) var pumpBusy = false
+    /// Side whose firmness change this app started and is still running.
+    private(set) var adjustingSide: BedSide?
     private(set) var queuedFirmness: [BedSide: Int] = [:]
     private(set) var requestedFirmness: [BedSide: Int] = [:]
     private(set) var head: [BedSide: Int] = [:]
-    private(set) var foot: Int?
+    private(set) var foot: [BedSide: Int] = [:]
     private(set) var lightOn: Bool?
     private(set) var moving = false
     private(set) var activePreset: [BedSide: BedPreset] = [:]
     private(set) var activeHold: HoldKey?
-    private(set) var busyAction: String?
     private(set) var lastUpdated: Date?
     var banner: String?
 
@@ -54,30 +56,45 @@ final class BedController {
         }
     }
 
+    /// Which sleeper's side the shared foot control commands (the app sends foot moves with
+    /// the sleeper's own side; the firmware drives the single foot motor).
+    var footSide: BedSide {
+        didSet { UserDefaults.standard.set(footSide.rawValue, forKey: Keys.footSide) }
+    }
+
     let log = DiagnosticsLog()
     let ble: BLEManager
 
     @ObservationIgnored private var driver: BedDriver?
     @ObservationIgnored private var pollTask: Task<Void, Never>?
     @ObservationIgnored private var holdTask: Task<Void, Never>?
+    @ObservationIgnored private var holdID = 0
+    @ObservationIgnored private var commandTasks: [Int: Task<Void, Never>] = [:]
+    @ObservationIgnored private var nextCommandID = 0
     @ObservationIgnored private var reconnectTask: Task<Void, Never>?
     @ObservationIgnored private var pollCycle = 0
-    @ObservationIgnored private var lastFirmnessSent: Date?
+    @ObservationIgnored private var firmnessSentAt: Date?
     @ObservationIgnored private var autoReconnect = true
     @ObservationIgnored private var pendingConnectName: String?
 
     private enum Keys {
         static let savedBed = "savedBed"
         static let swapSides = "swapSides"
+        static let footSide = "footSide"
+        static let mcrClientID = "mcrClientID"
     }
 
     var mapping: SideMapping { SideMapping(swapped: swapSides) }
     var isReady: Bool { phase == .ready }
-    var supportedPresets: [BedPreset] { driver?.supportedPresets ?? [.flat, .zeroG, .snore, .favorite, .read, .watchTV] }
+    var presetOptions: [PresetOption] {
+        driver?.presetOptions ?? [.preset(.favorite), .preset(.flat), .preset(.zeroG), .preset(.snore), .partnerSnore]
+    }
+    var hasUnderBedLight: Bool { driver?.hasUnderBedLight ?? true }
     var diagnostics: [(String, String)] { driver?.diagnostics ?? [] }
 
     init() {
         swapSides = UserDefaults.standard.bool(forKey: Keys.swapSides)
+        footSide = BedSide(rawValue: UserDefaults.standard.string(forKey: Keys.footSide) ?? "") ?? .left
         if let data = UserDefaults.standard.data(forKey: Keys.savedBed),
            let bed = try? JSONDecoder().decode(SavedBed.self, from: data) {
             savedBed = bed
@@ -88,6 +105,19 @@ final class BedController {
         ble.onDisconnect = { [weak self] error in self?.linkLost(error) }
         ble.onNotification = { [weak self] characteristic, data in self?.driver?.handleNotification(characteristic, data) }
         phase = savedBed == nil ? .noBed : .searching(savedBed?.name ?? "bed")
+    }
+
+    /// The official app's persisted random 64-bit MCR client ID, created once.
+    private var mcrClientID: [UInt8] {
+        if let data = UserDefaults.standard.data(forKey: Keys.mcrClientID), data.count == 8 {
+            return [UInt8](data)
+        }
+        var id = [UInt8](repeating: 0, count: 8)
+        repeat {
+            id = (0..<8).map { _ in UInt8.random(in: 0...255) }
+        } while id.allSatisfy { $0 == 0 }
+        UserDefaults.standard.set(Data(id), forKey: Keys.mcrClientID)
+        return id
     }
 
     // MARK: Connection policy
@@ -113,6 +143,9 @@ final class BedController {
 
     /// Connects to a device picked from the scan list and remembers it.
     func choose(_ device: ScannedDevice) {
+        stopMotionBeforeLeaving()
+        tearDownDriver()
+        ble.disconnect()
         let bed = SavedBed(id: device.id, name: device.name, lastProtocol: device.classification.likelyProtocol)
         save(bed)
         autoReconnect = true
@@ -129,9 +162,10 @@ final class BedController {
     func disconnect() {
         autoReconnect = false
         reconnectTask?.cancel()
+        stopMotionBeforeLeaving()
         tearDownDriver()
         ble.disconnect()
-        phase = savedBed == nil ? .noBed : .failed("Disconnected. Tap Connect to reconnect.")
+        phase = savedBed == nil ? .noBed : .failed("Disconnected. Tap Retry to reconnect.")
     }
 
     func forgetBed() {
@@ -141,8 +175,20 @@ final class BedController {
         phase = .noBed
     }
 
+    /// Best-effort stop frames before dropping the link while something may be moving.
+    private func stopMotionBeforeLeaving() {
+        guard let driver, activeHold != nil || moving || pumpBusy else { return }
+        holdTask?.cancel()
+        Task { try? await driver.stopAll() }
+    }
+
     private func connect(id: UUID, name: String) {
         reconnectTask?.cancel()
+        guard ble.knows(id) else {
+            autoReconnect = false
+            phase = .failed("This phone no longer knows the bed. Choose it again from the scan list.")
+            return
+        }
         pendingConnectName = name
         phase = .searching(name)
         ble.connect(id: id, name: name)
@@ -158,12 +204,13 @@ final class BedController {
     private func linkReady(_ kind: BedProtocol) {
         protocolKind = kind
         let name = savedBed?.name ?? pendingConnectName ?? "bed"
-        phase = .connecting(kind == .mcr ? "Handshaking with \(name)…" : "Authenticating with \(name)…")
+        phase = .connecting(kind == .mcr ? "Binding with \(name)…" : "Authenticating with \(name)…")
         tearDownDriver()
         let newDriver: BedDriver
         switch kind {
         case .mcr:
-            newDriver = MCRDriver(ble: ble, log: log, macFallback: BedDetector.mcrAddress(fromMACName: name),
+            newDriver = MCRDriver(ble: ble, log: log, clientID: mcrClientID,
+                                  macFallback: BedDetector.mcrAddress(fromMACName: name),
                                   mapping: { [weak self] in self?.mapping ?? SideMapping() })
         case .fuzion:
             newDriver = FuzionDriver(ble: ble, log: log, mapping: { [weak self] in self?.mapping ?? SideMapping() })
@@ -216,7 +263,6 @@ final class BedController {
             autoReconnect = false
             return
         }
-        if case .failed = phase, !autoReconnect { return }
         guard let savedBed, autoReconnect else {
             phase = .failed(error?.localizedDescription ?? "Disconnected.")
             return
@@ -245,10 +291,11 @@ final class BedController {
         activeHold = nil
         pollTask?.cancel()
         pollTask = nil
+        cancelCommands()
         driver?.reset()
         driver = nil
         queuedFirmness.removeAll()
-        busyAction = nil
+        adjustingSide = nil
     }
 
     // MARK: Polling
@@ -260,10 +307,12 @@ final class BedController {
             while !Task.isCancelled {
                 if activeHold == nil {
                     await refreshNow()
-                    await processFirmnessQueue()
+                    processFirmnessQueue()
                 }
-                let busy = moving || pumping.values.contains(true) || !queuedFirmness.isEmpty
-                let interval: Duration = busy ? .seconds(2) : (protocolKind == .fuzion ? .seconds(10) : .seconds(5))
+                // While an adjustment runs, poll every second like the app; otherwise relax.
+                let interval: Duration = adjustingSide != nil || pumpBusy ? .seconds(1)
+                    : moving || !queuedFirmness.isEmpty ? .seconds(2)
+                    : (protocolKind == .fuzion ? .seconds(10) : .seconds(5))
                 try? await Task.sleep(for: interval)
             }
         }
@@ -286,11 +335,21 @@ final class BedController {
     private func apply(_ reading: BedReading) {
         for (side, value) in reading.firmness {
             firmness[side] = value
-            if requestedFirmness[side] == value { requestedFirmness[side] = nil }
         }
-        for (side, value) in reading.pumping { pumping[side] = value }
+        if let busy = reading.pumpBusy {
+            pumpBusy = busy
+            // The app waits 1 s after a set, then polls until the pump is idle.
+            let settled = firmnessSentAt.map { Date().timeIntervalSince($0) > 1.5 } ?? true
+            if !busy && settled {
+                if let side = adjustingSide {
+                    log.info("App", "\(side.title) firmness adjustment finished")
+                    requestedFirmness[side] = nil
+                }
+                adjustingSide = nil
+            }
+        }
         for (side, value) in reading.head { head[side] = value }
-        if let foot = reading.foot { self.foot = foot }
+        for (side, value) in reading.foot { foot[side] = value }
         if let lightOn = reading.lightOn { self.lightOn = lightOn }
         if let moving = reading.moving { self.moving = moving }
         for (side, preset) in reading.activePreset { activePreset[side] = preset }
@@ -298,16 +357,25 @@ final class BedController {
 
     // MARK: Commands
 
+    /// Runs a command as a tracked task so STOP can cancel it.
     private func perform(_ label: String, _ action: @escaping (BedDriver) async throws -> Void) {
         guard let driver, phase == .ready else {
             banner = "Not connected to the bed."
             return
         }
-        busyAction = label
-        Task {
-            defer { if busyAction == label { busyAction = nil } }
+        guard activeHold == nil else {
+            banner = "Release the movement button first."
+            return
+        }
+        nextCommandID += 1
+        let id = nextCommandID
+        commandTasks[id] = Task {
+            defer { commandTasks[id] = nil }
             do {
                 try await action(driver)
+            } catch is CancellationError {
+            } catch BedError.cancelled {
+                log.info("App", "\(label) cancelled")
             } catch {
                 let message = (error as? BedError)?.localizedDescription ?? error.localizedDescription
                 log.error("App", "\(label) failed: \(message)")
@@ -316,11 +384,21 @@ final class BedController {
         }
     }
 
-    func activate(_ preset: BedPreset, side: BedSide) {
-        perform("\(preset.title) (\(side.title))") { driver in
-            try await driver.activate(preset, side: side)
+    private func cancelCommands() {
+        commandTasks.values.forEach { $0.cancel() }
+        commandTasks.removeAll()
+    }
+
+    func activate(_ option: PresetOption, side: BedSide) {
+        let (preset, target): (BedPreset, BedSide)
+        switch option {
+        case .preset(let chosen): (preset, target) = (chosen, side)
+        case .partnerSnore: (preset, target) = (.snore, side.other)
+        }
+        perform("\(option.title) (\(side.title))") { driver in
+            try await driver.activate(preset, side: target)
             self.moving = true
-            self.activePreset[side] = nil
+            self.activePreset[target] = nil
         }
     }
 
@@ -332,37 +410,41 @@ final class BedController {
         }
     }
 
-    /// Requests a firmness change. If the other side's chamber is adjusting, the request waits:
-    /// the pump serves one side at a time and a new set would interrupt the other side.
+    /// Requests a firmness change. The pump serves one side at a time, so a request waits while
+    /// the pump is busy with the other side (or with an adjustment this app did not start).
+    /// A new value for the side already adjusting interrupts and replaces it, as the app does.
     func setFirmness(_ value: Int, side: BedSide) {
         let normalized = SleepNumber.normalize(value)
         requestedFirmness[side] = normalized
-        if pumping[side.other] == true || queuedFirmness[side.other] != nil || recentlySentFirmness {
+        if adjustingSide == side {
+            sendFirmness(normalized, side: side, interrupt: true)
+        } else if pumpBusy || adjustingSide != nil {
             queuedFirmness[side] = normalized
             log.info("App", "\(side.title) firmness \(normalized) queued until the pump is idle")
-            return
+        } else {
+            sendFirmness(normalized, side: side, interrupt: false)
         }
-        sendFirmness(normalized, side: side)
     }
 
-    private var recentlySentFirmness: Bool {
-        guard let lastFirmnessSent else { return false }
-        return Date().timeIntervalSince(lastFirmnessSent) < 6
-    }
-
-    private func sendFirmness(_ value: Int, side: BedSide) {
+    private func sendFirmness(_ value: Int, side: BedSide, interrupt: Bool) {
         queuedFirmness[side] = nil
-        lastFirmnessSent = Date()
+        adjustingSide = side
+        pumpBusy = true
+        firmnessSentAt = Date()
         perform("Firmness \(value) (\(side.title))") { driver in
-            try await driver.setFirmness(value, side: side)
-            self.pumping[side] = true
+            do {
+                try await driver.setFirmness(value, side: side, interruptRunning: interrupt)
+            } catch {
+                if self.adjustingSide == side { self.adjustingSide = nil }
+                throw error
+            }
         }
     }
 
-    private func processFirmnessQueue() async {
-        guard !queuedFirmness.isEmpty, !pumping.values.contains(true), !recentlySentFirmness else { return }
+    private func processFirmnessQueue() {
+        guard !queuedFirmness.isEmpty, !pumpBusy, adjustingSide == nil else { return }
         let side: BedSide = queuedFirmness[.left] != nil ? .left : .right
-        if let value = queuedFirmness[side] { sendFirmness(value, side: side) }
+        if let value = queuedFirmness[side] { sendFirmness(value, side: side, interrupt: false) }
     }
 
     func cancelQueuedFirmness(_ side: BedSide) {
@@ -381,6 +463,8 @@ final class BedController {
         let key = HoldKey(axis: axis, side: side, direction: direction)
         activeHold = key
         moving = true
+        holdID += 1
+        let id = holdID
         log.info("App", "hold \(axis.rawValue) \(side.title) \(direction == .up ? "up" : "down")")
         holdTask = Task {
             do {
@@ -394,11 +478,16 @@ final class BedController {
                 log.error("App", "hold failed: \(message)")
                 banner = "Move failed: \(message)"
             }
-            // Always release, in a task that does not inherit this one's cancellation.
+            // Always release, in a task that does not inherit this one's cancellation, and keep
+            // running long enough to send the stop even if the app is being backgrounded.
+            let background = UIApplication.shared.beginBackgroundTask(withName: "Stop bed movement")
             let reading = await Task { @MainActor in await driver.releaseHold(axis, side: side) }.value
+            if background != .invalid { UIApplication.shared.endBackgroundTask(background) }
             if let reading { apply(reading) }
-            if activeHold == key { activeHold = nil }
-            holdTask = nil
+            if holdID == id {
+                activeHold = nil
+                holdTask = nil
+            }
         }
     }
 
@@ -413,8 +502,10 @@ final class BedController {
     func stopEverything() {
         log.info("App", "STOP pressed")
         holdTask?.cancel()
+        cancelCommands()
         queuedFirmness.removeAll()
         requestedFirmness.removeAll()
+        adjustingSide = nil
         guard let driver else { return }
         Task {
             do {
@@ -433,7 +524,7 @@ final class BedController {
         let info = Bundle.main.infoDictionary
         var lines = ["Bed Control \(info?["CFBundleShortVersionString"] ?? "?") (\(info?["CFBundleVersion"] ?? "?"))",
                      "Bed: \(savedBed?.name ?? "none") \(savedBed?.id.uuidString ?? "")",
-                     "Phase: \(phase)", "Swap sides: \(swapSides)"]
+                     "Phase: \(phase)", "Swap sides: \(swapSides)", "Foot side: \(footSide.title)"]
         lines += diagnostics.map { "\($0.0): \($0.1)" }
         return lines.joined(separator: "\n")
     }

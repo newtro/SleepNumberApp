@@ -15,10 +15,11 @@ The protocol is picked automatically from the services the bed exposes.
 - Scan list that highlights likely Sleep Number beds; the chosen bed is remembered and
   reconnected automatically.
 - Left and right panels: firmness (Sleep Number 5-100 in steps of 5, current value and
-  adjustment status), head up/down, presets (Flat, Zero G, Snore, Favorite, Read, TV).
+  adjustment status), head up/down, and the presets the foundation supports (on a FlexFit 2:
+  Favorite, Flat, Zero G, Snore, Partner Snore).
 - Shared foot up/down, under-bed light, and a big STOP button.
-- Press-and-hold movement uses bounded 10-point targets, so the bed stops on its own within
-  one step if the phone or link fails. Releasing always sends a stop.
+- Press-and-hold movement works like the official app (target 100/0 with 333 ms status polls)
+  and always sends the app's stop on release. STOP also drops any queued command.
 - Firmness changes run one side at a time; a change for the other side waits in a queue.
 - Clear errors for pairing problems ("press the pair button") and the connection limit
   ("close the Sleep Number app").
@@ -33,7 +34,8 @@ The protocol is picked automatically from the services the bed exposes.
 | `BedControl/BLE` | CoreBluetooth transport (`BLEManager`) |
 | `BedControl/Control` | Protocol drivers, `BedController` (connection policy, polling, holds, firmness queue), diagnostics log |
 | `BedControl/Views` | SwiftUI screens |
-| `docs/PROTOCOL-NOTES.md` | What is sent and why, plus the list of unverified details |
+| `docs/PROTOCOL-FROM-APK.md` | The official app's protocol, from its decompiled code (authoritative) |
+| `docs/PROTOCOL-NOTES.md` | What Bed Control sends and why, plus the list of unverified details |
 
 ## Build
 
@@ -62,7 +64,8 @@ The simulator has no Bluetooth, so the app only does real work on a device.
 
 ## Credits
 
-The protocol knowledge comes from these projects (ha-adjustable-bed and BedRemote are MIT-licensed; sleepnumber-ble ships no license file). This app is an independent
+The protocol behaviour follows the official SleepIQ app as analysed in
+`docs/PROTOCOL-FROM-APK.md`. Test vectors, live captures and background came from these projects (ha-adjustable-bed and BedRemote are MIT-licensed; sleepnumber-ble ships no license file). This app is an independent
 implementation; no code was copied.
 
 - [ha-adjustable-bed](https://github.com/kristofferR/ha-adjustable-bed) by kristofferR

@@ -1,8 +1,7 @@
 import BedKit
 import Foundation
 
-/// Fuzion (BamKey) bed driver: framed text commands on the BamKey characteristic after a
-/// bonded Auth read.
+/// Fuzion (BamKey) bed driver, following the official app (docs/PROTOCOL-FROM-APK.md §3, §4).
 @MainActor
 final class FuzionDriver: BedDriver {
     let kind = BedProtocol.fuzion
@@ -10,7 +9,6 @@ final class FuzionDriver: BedDriver {
     private let ble: BLEManager
     private let log: DiagnosticsLog
     private let mapping: () -> SideMapping
-    private let planner = MotionPlanner(step: 10, retargetMargin: 3)
     private var config: FuzionSystemConfiguration?
     private var lightTimer = 0
     private var lastLightLevel: FuzionLightLevel = .high
@@ -22,11 +20,15 @@ final class FuzionDriver: BedDriver {
         session = FuzionSession(link: ble, log: { log.append($0) })
     }
 
-    var supportedPresets: [BedPreset] {
-        let all: [BedPreset] = [.flat, .zeroG, .snore, .favorite, .read, .watchTV]
-        guard let config else { return all }
-        return all.filter(config.supports)
+    var presetOptions: [PresetOption] {
+        let order: [BedPreset] = [.favorite, .flat, .zeroG, .snore, .watchTV, .read]
+        let presets = config.map { config in order.filter(config.supports) } ?? order
+        var options = presets.map(PresetOption.preset)
+        if presets.contains(.snore) && (config?.isSplit ?? true) { options.append(.partnerSnore) }
+        return options
     }
+
+    var hasUnderBedLight: Bool { config?.hasUnderBedLight ?? true }
 
     var diagnostics: [(String, String)] {
         var rows: [(String, String)] = [("Protocol", kind.displayName)]
@@ -34,15 +36,8 @@ final class FuzionDriver: BedDriver {
         if let config {
             rows += FuzionSystemConfiguration.fieldNames.map { ($0, config.fields[$0] ?? "?") }
         }
-        rows.append(("Left side", "Fuzion \(mapping().fuzionSide(for: .left).rawValue)"))
+        rows.append(("Sides", "Left = Fuzion \(mapping().fuzionSide(for: .left).rawValue)"))
         return rows
-    }
-
-    /// The side whose foot actuator drives the shared foot (first one SYCG reports present).
-    private var footSide: FuzionSide {
-        guard let config else { return .left }
-        if config.fields["left_foot_actuator"] != "no" { return .left }
-        return .right
     }
 
     func start() async throws {
@@ -51,9 +46,6 @@ final class FuzionDriver: BedDriver {
         let id = try await session.authenticate()
         log.info("Fuzion", "session \(id.hexString)")
         try await ble.enableNotifications(.fuzionBamKey)
-        if ble.has(.fuzionBulk) {
-            do { try await ble.enableNotifications(.fuzionBulk) } catch { log.info("Fuzion", "bulk notify unavailable: \(error.localizedDescription)") }
-        }
         do {
             config = try await session.systemConfiguration()
         } catch {
@@ -61,20 +53,27 @@ final class FuzionDriver: BedDriver {
         }
     }
 
+    private func hasActuator(_ side: FuzionSide, _ actuator: FuzionActuator) -> Bool {
+        config?.fields["\(side.rawValue)_\(actuator.rawValue)_actuator"] != "no"
+    }
+
     func refresh(includeLight: Bool) async throws -> BedReading {
         var reading = BedReading()
         let map = mapping()
+        var busy = false
         for side in BedSide.allCases {
             let wire = map.fuzionSide(for: side)
             if config?.isSingleChamber != true || wire == .right {
                 let controls = try await session.sleepNumberControls(wire)
                 reading.firmness[side] = controls.user
-                reading.pumping[side] = controls.adjusting
+                busy = busy || controls.adjusting
             }
-            reading.head[side] = try await session.actuatorPosition(wire, actuator: .head)
+            if hasActuator(wire, .head) { reading.head[side] = try await session.actuatorPosition(wire, actuator: .head) }
+            if hasActuator(wire, .foot) { reading.foot[side] = try await session.actuatorPosition(wire, actuator: .foot) }
         }
-        reading.foot = try await session.actuatorPosition(footSide, actuator: .foot)
-        if includeLight {
+        reading.pumpBusy = busy
+        do { reading.moving = try await session.movementStatus().any } catch { log.info("Fuzion", "ACTM failed: \(error.localizedDescription)") }
+        if includeLight && hasUnderBedLight {
             do {
                 let light = try await session.underBedLight()
                 lightTimer = light.timer
@@ -91,61 +90,54 @@ final class FuzionDriver: BedDriver {
         try await session.send(.setPreset(mapping().fuzionSide(for: side), preset: preset))
     }
 
-    func setFirmness(_ value: Int, side: BedSide) async throws {
-        try await session.send(try .startSleepNumberAdjustment(mapping().fuzionSide(for: side), value: value))
+    func setFirmness(_ value: Int, side: BedSide, interruptRunning: Bool) async throws {
+        let generation = session.stopGeneration
+        if interruptRunning {
+            try await session.send(.interruptSleepNumberAdjustment(), generation: generation)
+            try await Task.sleep(for: .milliseconds(500))
+        }
+        try await session.send(try .startSleepNumberAdjustment(mapping().fuzionSide(for: side), value: value), generation: generation)
     }
 
     func setLight(_ on: Bool) async throws {
         try await session.send(try .setUnderBedLight(level: on ? lastLightLevel : .off, timerMinutes: lightTimer))
     }
 
-    private func wireSide(_ axis: FoundationAxis, _ side: BedSide) -> FuzionSide {
-        axis == .foot ? footSide : mapping().fuzionSide(for: side)
-    }
-
     func hold(_ axis: FoundationAxis, side: BedSide, direction: MoveDirection,
               update: @escaping (BedReading) -> Void) async throws {
-        let wire = wireSide(axis, side)
+        // Each sleeper's own side, for the foot too (the app never redirects foot commands).
+        let wire = mapping().fuzionSide(for: side)
         let actuator = FuzionActuator(axis)
-        var current = try await session.actuatorPosition(wire, actuator: actuator)
-        guard var target = planner.nextTarget(from: current, direction: direction) else { return }
-        try await session.send(try .setActuatorTarget(wire, actuator: actuator, position: target))
+        try await session.send(try .microAdjust(wire, actuator: actuator, target: direction.holdTarget))
 
         let clock = ContinuousClock()
-        let deadline = clock.now + HoldLimits.maxHold
-        var lastChange = clock.now
-        while !Task.isCancelled && clock.now < deadline {
-            try await Task.sleep(for: .milliseconds(300))
-            let measured = try await session.actuatorPosition(wire, actuator: actuator)
+        let started = clock.now
+        let deadline = started + HoldLimits.maxHold
+        while clock.now < deadline {
+            try await Task.sleep(for: HoldLimits.pollInterval)
+            let movement = try await session.movementStatus()
+            let position = try await session.actuatorPosition(wire, actuator: actuator)
             var reading = BedReading()
-            if axis == .foot { reading.foot = measured } else { reading.head[side] = measured }
-            reading.moving = true
+            if axis == .foot { reading.foot[side] = position } else { reading.head[side] = position }
+            reading.moving = movement.any
             update(reading)
-            if measured != current {
-                current = measured
-                lastChange = clock.now
-            } else if clock.now - lastChange > HoldLimits.stall {
-                log.info("Fuzion", "hold stopped: \(axis.rawValue) did not move for \(HoldLimits.stall)")
+            // Give the motor a moment to start before treating "not moving" as finished.
+            if !movement.any && clock.now - started > .seconds(1) {
+                log.info("Fuzion", "hold: actuators report stopped")
                 return
             }
-            if planner.shouldRetarget(current: current, target: target, direction: direction) {
-                guard let next = planner.nextTarget(from: current, direction: direction) else { return }
-                if next != target {
-                    target = next
-                    try await session.send(try .setActuatorTarget(wire, actuator: actuator, position: target))
-                }
-            }
         }
+        log.info("Fuzion", "hold: safety deadline reached")
     }
 
     func releaseHold(_ axis: FoundationAxis, side: BedSide) async -> BedReading? {
-        // ACHA is the app's only halt; it is global, so it also stops the other side.
+        // ACHA is the app's release; it halts every actuator, so it also stops the other side.
         do { try await session.sendUrgent(.haltAllActuators()) } catch { log.error("Fuzion", "halt failed: \(error.localizedDescription)") }
         try? await Task.sleep(for: .milliseconds(300))
-        let wire = wireSide(axis, side)
+        let wire = mapping().fuzionSide(for: side)
         guard let position = try? await session.actuatorPosition(wire, actuator: FuzionActuator(axis)) else { return nil }
         var reading = BedReading()
-        if axis == .foot { reading.foot = position } else { reading.head[side] = position }
+        if axis == .foot { reading.foot[side] = position } else { reading.head[side] = position }
         reading.moving = false
         return reading
     }

@@ -47,6 +47,10 @@ final class BLEManager: NSObject, GATTLink {
     @ObservationIgnored private var pendingReads: [BedCharacteristic: [CheckedContinuation<Data, Error>]] = [:]
     @ObservationIgnored private var pendingWrite: CheckedContinuation<Void, Error>?
     @ObservationIgnored private var writeSequence: UInt64 = 0
+    @ObservationIgnored private var subscribeSequence: UInt64 = 0
+    /// Reads abandoned by a timeout or cancellation whose late responses must be discarded,
+    /// so they are never handed to the next read on that characteristic.
+    @ObservationIgnored private var orphanedReads: [BedCharacteristic: Int] = [:]
     @ObservationIgnored private var notifyWaiters: [BedCharacteristic: CheckedContinuation<Void, Error>] = [:]
     @ObservationIgnored private var readyToSendWaiters: [CheckedContinuation<Void, Never>] = []
     @ObservationIgnored private let writeMutex = WriteMutex()
@@ -88,6 +92,11 @@ final class BLEManager: NSObject, GATTLink {
 
     // MARK: Connection
 
+    /// True if iOS can still hand us this peripheral (it was seen or paired before).
+    func knows(_ id: UUID) -> Bool {
+        bluetoothState != .poweredOn || !central.retrievePeripherals(withIdentifiers: [id]).isEmpty
+    }
+
     /// Connects to a known peripheral. CoreBluetooth keeps the request pending until the bed is
     /// in range, which is what auto-reconnect wants; `disconnect()` cancels it.
     func connect(id: UUID, name: String) {
@@ -96,6 +105,9 @@ final class BLEManager: NSObject, GATTLink {
             log.error("BLE", "peripheral \(id) is unknown to iOS; scan for it again")
             onDisconnect?(.transport("This phone no longer knows the bed. Scan for it again."))
             return
+        }
+        if let previous = peripheral {
+            central.cancelPeripheralConnection(previous)
         }
         cleanupConnection(error: nil, notify: false)
         stopScan()
@@ -122,12 +134,15 @@ final class BLEManager: NSObject, GATTLink {
     func enableNotifications(_ characteristic: BedCharacteristic) async throws {
         guard let peripheral, let target = characteristics[characteristic] else { throw BedError.notConnected }
         if target.isNotifying { return }
+        subscribeSequence &+= 1
+        let sequence = subscribeSequence
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             notifyWaiters[characteristic]?.resume(throwing: BedError.cancelled)
             notifyWaiters[characteristic] = continuation
             peripheral.setNotifyValue(true, for: target)
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(15))
+                guard self.subscribeSequence == sequence else { return }
                 if let waiter = self.notifyWaiters.removeValue(forKey: characteristic) {
                     waiter.resume(throwing: BedError.timeout("subscribe to \(characteristic.rawValue)"))
                 }
@@ -144,11 +159,17 @@ final class BLEManager: NSObject, GATTLink {
         await writeMutex.lock()
         defer { writeMutex.unlock() }
         guard let peripheral, let target = characteristics[characteristic] else { throw BedError.notConnected }
-        let withoutResponse = target.properties.contains(.writeWithoutResponse)
-        let type: CBCharacteristicWriteType = withoutResponse ? .withoutResponse : .withResponse
+        // MCR: the app writes with response whenever the characteristic allows it, in 20-byte
+        // pieces. Fuzion: write-without-response in MTU-4 pieces.
+        let withoutResponse: Bool
+        if characteristic == .mcrWrite {
+            withoutResponse = !target.properties.contains(.write)
+        } else {
+            withoutResponse = target.properties.contains(.writeWithoutResponse)
+        }
         let chunkSize = characteristic == .mcrWrite
             ? BLEManager.mcrChunkSize
-            : max(20, peripheral.maximumWriteValueLength(for: type))
+            : max(20, peripheral.maximumWriteValueLength(for: .withoutResponse) - 1)
         var offset = 0
         while offset < frame.count {
             let end = min(offset + chunkSize, frame.count)
@@ -172,6 +193,9 @@ final class BLEManager: NSObject, GATTLink {
                         if self.writeSequence == sequence, let waiting = self.pendingWrite {
                             self.pendingWrite = nil
                             waiting.resume(throwing: BedError.timeout("BLE write"))
+                            // A late confirmation could complete the wrong write; treat the link as broken.
+                            self.log.error("BLE", "write confirmation timed out; dropping the link")
+                            if let current = self.peripheral { self.central.cancelPeripheralConnection(current) }
                         }
                     }
                 }
@@ -211,6 +235,9 @@ final class BLEManager: NSObject, GATTLink {
 
     private func failReads(_ characteristic: BedCharacteristic, _ error: BedError) {
         let waiters = pendingReads.removeValue(forKey: characteristic) ?? []
+        if error != .notConnected && peripheral != nil {
+            orphanedReads[characteristic, default: 0] += waiters.count
+        }
         waiters.forEach { $0.resume(throwing: error) }
     }
 
@@ -224,6 +251,7 @@ final class BLEManager: NSObject, GATTLink {
         notifyWaiters.removeAll()
         resumeReadyToSend()
         characteristics.removeAll()
+        orphanedReads.removeAll()
         peripheral?.delegate = nil
         peripheral = nil
         if notify { onDisconnect?(error) }
@@ -421,6 +449,11 @@ extension BLEManager: CBPeripheralDelegate {
             }
             let value = characteristic.value ?? Data()
             let isHint = id == .fuzionBamKey && (isFuzionHint?(value) ?? false)
+            if !isHint, let orphans = orphanedReads[id], orphans > 0 {
+                orphanedReads[id] = orphans - 1
+                log.info(id.rawValue, "discarded late read result (\(value.count)b) from an abandoned read")
+                return
+            }
             if !isHint, let waiter = pendingReads[id]?.first {
                 pendingReads[id]?.removeFirst()
                 waiter.resume(returning: value)

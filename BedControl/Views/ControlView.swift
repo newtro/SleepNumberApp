@@ -16,7 +16,7 @@ struct ControlView: View {
                     SidePanel(side: .right)
                 }
                 FootPanel()
-                LightRow()
+                if controller.hasUnderBedLight { LightRow() }
             }
             .padding(.horizontal, 14)
             .padding(.top, 6)
@@ -146,25 +146,30 @@ private struct SidePanel: View {
             Divider()
 
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 6), GridItem(.flexible(), spacing: 6)], spacing: 6) {
-                ForEach(controller.supportedPresets) { preset in
+                ForEach(controller.presetOptions) { option in
                     Button {
-                        controller.activate(preset, side: side)
+                        controller.activate(option, side: side)
                     } label: {
                         VStack(spacing: 3) {
-                            Image(systemName: preset.symbol).font(.body)
-                            Text(preset.title).font(.caption2.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
+                            Image(systemName: option.symbol).font(.body)
+                            Text(option.title).font(.caption2.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
                         }
                         .frame(maxWidth: .infinity, minHeight: 46)
                     }
                     .buttonStyle(.bordered)
-                    .tint(controller.activePreset[side] == preset ? .accentColor : .secondary)
-                    .accessibilityLabel("\(preset.title) preset, \(side.title) side")
+                    .tint(isActive(option) ? .accentColor : .secondary)
+                    .accessibilityLabel("\(option.accessibilityName), \(side.title) side")
                 }
             }
         }
         .padding(12)
         .frame(maxWidth: .infinity)
         .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    private func isActive(_ option: PresetOption) -> Bool {
+        if case .preset(let preset) = option { return controller.activePreset[side] == preset }
+        return false
     }
 }
 
@@ -212,11 +217,12 @@ private struct FirmnessControl: View {
     }
 
     private var status: String? {
-        if let queued = controller.queuedFirmness[side] { return "Queued \(queued): waits for \(side.other.title.lowercased()) side" }
-        if controller.pumping[side] == true {
+        if let queued = controller.queuedFirmness[side] { return "Queued \(queued): waits for the pump" }
+        if controller.adjustingSide == side {
             if let target = controller.requestedFirmness[side] { return "Adjusting to \(target)…" }
             return "Adjusting…"
         }
+        if controller.pumpBusy && controller.adjustingSide == nil { return "Pump busy" }
         return nil
     }
 
@@ -238,17 +244,25 @@ private struct FootPanel: View {
     @Environment(BedController.self) private var controller
 
     var body: some View {
+        @Bindable var controller = controller
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("Foot").font(.title3.weight(.bold))
                 Text("shared").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Text(controller.foot.map { "\($0)%" } ?? "–").font(.subheadline.monospacedDigit()).foregroundStyle(.secondary)
+                Text(controller.foot[controller.footSide].map { "\($0)%" } ?? "–")
+                    .font(.subheadline.monospacedDigit()).foregroundStyle(.secondary)
             }
-            PositionBar(value: controller.foot)
+            PositionBar(value: controller.foot[controller.footSide])
+            Picker("Send as", selection: $controller.footSide) {
+                ForEach(BedSide.allCases) { Text("As \($0.title)").tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .disabled(controller.activeHold != nil)
+            .accessibilityHint("Which sleeper's side the foot commands are sent for")
             HStack(spacing: 10) {
-                HoldButton(axis: .foot, side: .left, direction: .up)
-                HoldButton(axis: .foot, side: .left, direction: .down)
+                HoldButton(axis: .foot, side: controller.footSide, direction: .up)
+                HoldButton(axis: .foot, side: controller.footSide, direction: .down)
             }
         }
         .padding(12)
