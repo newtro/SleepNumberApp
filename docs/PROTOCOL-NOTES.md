@@ -63,7 +63,11 @@ MCR), or manufacturer data with company ID `0x534E`.
   are written immediately (bypassing the request queue), then sent again through the queue so
   the acknowledgement is checked. STOP also invalidates every queued or retrying request, so a
   preset waiting behind a slow poll, or a retry after a lost reply, cannot go out after STOP.
-  The big STOP button stops both sides and sends pump ForceIdle.
+  The big STOP button stops both sides and sends pump ForceIdle. After a stop the app reads
+  foundation status and re-sends the stop (up to 3 times) while it still reports motion. Stop
+  frames are exempt from the stop generation, so two overlapping stops never cancel each other.
+  Disconnecting or switching beds waits (up to 3 s) for the stop sequence before dropping the
+  link, and a stalled write triggers a stop before the link is dropped.
 - Split head, shared foot: as in the app, foot commands carry the sleeper's own side and the
   firmware drives the single motor. The foot control has an "As Left / As Right" picker.
 - Absolute set-position (`MFU*`/`MFF*` = `"<pos>_0"`) has a tested builder but no UI yet.
@@ -86,6 +90,10 @@ MCR), or manufacturer data with company ID `0x534E`.
 - Commands: `SNCG`, `PSNS`, `PSNI`, `ASTP side preset` (presets), `ASTM side loc 100|0` (hold),
   `ACTG`, `ACTM`, `ACHA` (release and STOP; global, both sides), `UBLG`, `UBLS`, `SYCG`.
   Hold polls `ACTM` + `ACTG` every 333 ms. Foot commands use the sleeper's own side.
+  Release and STOP write `ACHA` immediately, then again through the queue until `PASS`, then
+  re-send while `ACTM` reports movement (up to 3 times).
+
+Saved per-side favorites are specified in `docs/FAVORITES-SPEC.md`.
 
 ## Unverified
 
@@ -93,7 +101,9 @@ MCR), or manufacturer data with company ID `0x534E`.
    only while the keep-adjusting polls arrive. If not, the bed would run toward 100/0 until the
    stop key arrives. The app always sends the stop on release, on STOP, when backgrounded and
    before disconnecting, but whether the bed stops by itself if the phone dies mid-hold is
-   untested.
+   untested. **Test before relying on it:** start a hold, switch the phone to airplane mode,
+   and check the bed stops within about a second. If it does not, holds should go back to
+   bounded targets (current ±15, extended as each is reached) using the same cmd `0x11`.
 2. **`MFHx = "110"` as the stop.** Static analysis only; its meaning is unknown. The earlier
    BedRemote foundation ForceIdle (`0x42` cmd `0x02`) is not sent because the app never uses it.
 3. **Left foot on a split-head base.** The app sends foot moves with either side; the spec
@@ -114,3 +124,45 @@ MCR), or manufacturer data with company ID `0x534E`.
 10. **Fuzion urgent `ACHA`** is written outside the request queue so STOP never waits; queued
     commands are dropped by the stop generation, but a command already waiting for its
     "response ready" hint could consume ACHA's hint (logging only).
+11. **Deferred from the favorites review (owner's bed is MCR):** the Fuzion pump-busy rule for
+    favorites reads only the favorite's own side (`SNCG`), and single-chamber beds map both sides
+    to `right`; favorites send the foot with the favorite's side and ignore the foot picker. Both
+    are open items in `docs/FAVORITES-SPEC.md` §4.
+
+## Android (android/)
+
+The Android app is a Kotlin + Jetpack Compose port. `android/bedkit` is a pure-JVM port of BedKit
+plus the drivers and favorites (tested against the iOS vectors and a simulated MCR bed);
+`android/app` holds the BLE transport, controller and UI. It follows the same protocol choices as
+iOS, including everything in the Unverified list above. Android-specific behaviour:
+
+- Bed identity is the Bluetooth MAC address (also the MCR bind MAC fallback and the favorites
+  file key). After a ready link drops, reconnect uses Android's background auto-connect, which
+  stays pending until the bed is back in range.
+- One GATT operation at a time (`GattOpQueue`). MCR with-response writes time out after 1.5 s; a
+  timed-out operation's late callback is discarded for 1 s so it cannot complete a later
+  operation. On any timeout the controller gets up to 6 s to send its stop sequence before the
+  link is dropped.
+- Fuzion requests MTU 517 and bonds before reading Auth (30 s for the user to accept pairing).
+  Chunks are MTU-4, or MTU-5 on Android 14+, as in the official app.
+- Leaving the app (ON_STOP, not a rotation) releases a hold and cancels a favorite with a
+  confirmed stop. There is no foreground service, so a favorite does not keep running in the
+  background.
+
+### Deferred from the Android review (low severity)
+
+6. **A finished favorite job can clear a newer run's state.** The apply's `finally` resets
+   `applyingFavorite`/`favoriteJob` without a run id. It needs teardown, reconnect and a new Apply
+   inside one confirmed stop (a few seconds); STOP still works through the stop generation.
+7. **Write-stall stop and retries.** The stall stop now also covers in-flight commands and a busy
+   pump. Not done: MCR's timeout retry can still re-send a stalled preset inside the stop window
+   before the link drops. The stop sequence that follows still goes out.
+8. **The 3 s / 2 s stop budgets cannot cut a stop short.** `stopAll` runs under NonCancellable,
+   so with a bad radio Disconnect or choosing another bed can wait about 30 s. Kept deliberately:
+   finishing the stop matters more than leaving quickly. A deadline inside `stopConfirmed` would
+   be the fix.
+9. **Hold buttons stay locked during a slow confirmed release.** `activeHold` stays set until the
+   release's stop and status read finish. Commands say "Release the movement button first";
+   STOP still works. A separate "releasing" state would give a clearer message.
+10. **No quick retry after GATT status 133.** A first direct-connect failure shows Offline and
+    retries after 5 s instead of immediately.

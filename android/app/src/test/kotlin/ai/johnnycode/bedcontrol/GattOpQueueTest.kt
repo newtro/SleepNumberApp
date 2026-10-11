@@ -21,7 +21,7 @@ class GattOpQueueTest {
 
     @Test
     fun pairsEachOperationWithItsCallback() = runTest {
-        val queue = GattOpQueue()
+        val queue = GattOpQueue(now = { testScheduler.currentTime })
         val op = async { queue.run("write", "x", 1_500) { true } }
         runCurrent()
         assertTrue(queue.complete("write", "x", a))
@@ -31,7 +31,7 @@ class GattOpQueueTest {
     @Test
     fun lateCallbackOfATimedOutOperationCannotCompleteTheNextOne() = runTest {
         val timeouts = mutableListOf<String>()
-        val queue = GattOpQueue(onTimeout = { timeouts += it })
+        val queue = GattOpQueue(onTimeout = { timeouts += it }, now = { testScheduler.currentTime })
         // A stalled write (no callback) times out and poisons its key.
         val stalled = async { runCatching { queue.run("write", "x", 1_500) { true } } }
         advanceTimeBy(1_600)
@@ -50,8 +50,23 @@ class GattOpQueueTest {
     }
 
     @Test
+    fun poisonExpiresSoALostLateCallbackCannotStallTheStop() = runTest {
+        val queue = GattOpQueue(now = { testScheduler.currentTime })
+        val stalled = async { runCatching { queue.run("write", "x", 1_500) { true } } }
+        advanceTimeBy(1_600)
+        stalled.await()
+        // The late callback never arrives. After the poison window the stop's own callback counts.
+        advanceTimeBy(GattOpQueue.POISON_WINDOW_MS)
+        val stop = async { queue.run("write", "x", 1_500) { true } }
+        runCurrent()
+        assertTrue(queue.complete("write", "x", b))
+        assertArrayEquals(b, stop.await())
+        assertEquals(0, queue.poisonedCount)
+    }
+
+    @Test
     fun poisoningIsPerKindAndCharacteristic() = runTest {
-        val queue = GattOpQueue()
+        val queue = GattOpQueue(now = { testScheduler.currentTime })
         val stalled = async { runCatching { queue.run("read", "auth", 1_000) { true } } }
         advanceTimeBy(1_100)
         stalled.await()
@@ -64,7 +79,7 @@ class GattOpQueueTest {
 
     @Test
     fun cancelledCallerStillWaitsForItsCallback() = runTest {
-        val queue = GattOpQueue()
+        val queue = GattOpQueue(now = { testScheduler.currentTime })
         val op = async { queue.run("read", "x", 5_000) { true } }
         runCurrent()
         op.cancel()
@@ -84,7 +99,7 @@ class GattOpQueueTest {
 
     @Test
     fun resetFailsThePendingOperationAndClearsPoison() = runTest {
-        val queue = GattOpQueue()
+        val queue = GattOpQueue(now = { testScheduler.currentTime })
         val stalled = async { runCatching { queue.run("write", "x", 100) { true } } }
         advanceTimeBy(200)
         stalled.await()
@@ -97,7 +112,7 @@ class GattOpQueueTest {
 
     @Test
     fun refusedStartIsRetriedThenFails() = runTest {
-        val queue = GattOpQueue()
+        val queue = GattOpQueue(now = { testScheduler.currentTime })
         var tries = 0
         val result = runCatching { queue.run("write", "x", 1_000) { tries++; false } }
         assertEquals(5, tries)

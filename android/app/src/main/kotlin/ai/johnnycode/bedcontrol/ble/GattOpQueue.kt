@@ -27,15 +27,27 @@ import kotlinx.coroutines.withTimeoutOrNull
 class GattOpQueue(
     private val log: (String) -> Unit = {},
     private val onTimeout: (kind: String) -> Unit = {},
+    /** Monotonic milliseconds (injectable for tests). */
+    private val now: () -> Long = { System.nanoTime() / 1_000_000 },
 ) {
     private class Pending(val key: String, val deferred: CompletableDeferred<ByteArray>)
 
     private val mutex = Mutex()
     private var pending: Pending? = null
-    private val poisoned = mutableMapOf<String, Int>()
+
+    /**
+     * Per key, the deadlines until which a late callback of a timed-out operation is expected. Poison
+     * expires after [POISON_WINDOW_MS]: a callback that never comes must not swallow the genuine
+     * callback of a later operation (e.g. a stop frame's first chunk) forever.
+     */
+    private val poisoned = mutableMapOf<String, ArrayDeque<Long>>()
 
     /** Number of late callbacks still expected from timed-out operations (for tests/diagnostics). */
-    val poisonedCount: Int get() = poisoned.values.sum()
+    val poisonedCount: Int get() = poisoned.values.sumOf { q -> q.count { it > now() } }
+
+    companion object {
+        const val POISON_WINDOW_MS = 1_000L
+    }
 
     private fun key(kind: String, id: String?) = "$kind:${id ?: "-"}"
 
@@ -63,7 +75,7 @@ class GattOpQueue(
         }
         if (result == null) {
             if (pending?.deferred === deferred) pending = null
-            poisoned[opKey] = (poisoned[opKey] ?: 0) + 1
+            poisoned.getOrPut(opKey) { ArrayDeque() }.addLast(now() + POISON_WINDOW_MS)
             log("$kind timed out after $timeoutMs ms; a late $kind callback will be discarded")
             onTimeout(kind)
             throw BedError.Timeout("BLE $kind")
@@ -78,11 +90,16 @@ class GattOpQueue(
      */
     fun complete(kind: String, id: String?, value: ByteArray, error: BedError? = null): Boolean {
         val opKey = key(kind, id)
-        val late = poisoned[opKey] ?: 0
-        if (late > 0) {
-            if (late == 1) poisoned.remove(opKey) else poisoned[opKey] = late - 1
-            log("late $kind callback from a timed-out operation discarded")
-            return false
+        poisoned[opKey]?.let { deadlines ->
+            val t = now()
+            while (deadlines.isNotEmpty() && deadlines.first() <= t) deadlines.removeFirst()
+            if (deadlines.isNotEmpty()) {
+                deadlines.removeFirst()
+                if (deadlines.isEmpty()) poisoned.remove(opKey)
+                log("late $kind callback from a timed-out operation discarded")
+                return false
+            }
+            poisoned.remove(opKey)
         }
         val op = pending
         if (op == null || op.key != opKey) {

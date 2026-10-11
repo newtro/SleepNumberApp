@@ -162,9 +162,10 @@ class BedController(app: Application) : AndroidViewModel(app) {
         ble.onLinkStall = {
             // The link stays open until this returns: get the stop out before it is dropped.
             val d = driver
-            if (d != null && (activeHold != null || moving || pumpBusy || applyingFavorite != null)) {
+            if (d != null && (activeHold != null || moving || pumpBusy || applyingFavorite != null || commandsInFlight > 0)) {
                 holdJob?.cancel()
                 favoriteJob?.cancel()
+                cancelCommands()
                 runCatching { d.stopAll() }
             }
         }
