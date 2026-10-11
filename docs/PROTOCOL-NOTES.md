@@ -139,15 +139,18 @@ iOS, including everything in the Unverified list above. Android-specific behavio
 - Bed identity is the Bluetooth MAC address (also the MCR bind MAC fallback and the favorites
   file key). After a ready link drops, reconnect uses Android's background auto-connect, which
   stays pending until the bed is back in range.
-- One GATT operation at a time (`GattOpQueue`). MCR with-response writes time out after 1.5 s; a
-  timed-out operation's late callback is discarded for 1 s so it cannot complete a later
-  operation. On any timeout the controller gets up to 6 s to send its stop sequence before the
-  link is dropped.
+- One GATT operation at a time (`GattOpQueue`). An operation is registered only after Android
+  accepted it. MCR with-response writes time out after 1.5 s; the timed-out operation's late reply
+  is owed (no time limit) and is discarded when it arrives, so it can never complete a later
+  operation. While a reply is owed, a new operation (the stall stop) keeps retrying for up to 2 s
+  until the late reply frees the stack. On any timeout the controller gets up to 6 s to send its
+  stop sequence before the link is dropped.
 - Fuzion requests MTU 517 and bonds before reading Auth (30 s for the user to accept pairing).
   Chunks are MTU-4, or MTU-5 on Android 14+, as in the official app.
-- Leaving the app (ON_STOP, not a rotation) releases a hold and cancels a favorite with a
-  confirmed stop. There is no foreground service, so a favorite does not keep running in the
-  background.
+- Leaving the app releases a hold and cancels a favorite with a confirmed stop. There is no
+  foreground service, so a favorite does not keep running in the background. A rotation does not
+  cancel a running favorite, but it does release a hold: the hold button leaves the screen and
+  its release runs (intended; the finger is off the button).
 
 ### Deferred from the Android review (low severity)
 
@@ -166,3 +169,8 @@ iOS, including everything in the Unverified list above. Android-specific behavio
    STOP still works. A separate "releasing" state would give a clearer message.
 10. **No quick retry after GATT status 133.** A first direct-connect failure shows Offline and
     retries after 5 s instead of immediately.
+11. **The 6 s stall budget cannot cut the stall stop short** (re-review). `BleManager.linkBroken`
+    wraps the controller's stop in a 6 s timeout, but `stopAll`/`stopConfirmed` run under
+    NonCancellable, so on a dead link the stop sequence spends about 9-10 s on refused starts while
+    the link stays open and shows Ready. Android's own link-loss disconnect caps it, and STOP is
+    not blocked. Same fix as item 8: pass an explicit deadline into `stopConfirmed`.
