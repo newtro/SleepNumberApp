@@ -108,6 +108,7 @@ private class FakeOps(var head: Int = 0, var foot: Int = 50, var sleepNumber: In
     var stallAt: Int? = null
     var startGate: CompletableDeferred<Unit>? = null
     var stopConfirms = true
+    var faultAfterStart = false
 
     override suspend fun startMove(axis: FoundationAxis, position: Int) {
         commands += "move ${axis.title} $position"
@@ -116,6 +117,7 @@ private class FakeOps(var head: Int = 0, var foot: Int = 50, var sleepNumber: In
     }
 
     override suspend fun readPosition(axis: FoundationAxis): PositionReading {
+        if (faultAfterStart && commands.isNotEmpty()) throw BedError.CommandFailed("${axis.title} actuator: motor current high")
         target?.let { (a, t) ->
             val current = if (a == FoundationAxis.HEAD) head else foot
             var next = if (t > current) minOf(t, current + 10) else maxOf(t, current - 10)
@@ -239,8 +241,19 @@ class FavoriteApplierTest {
         assertEquals(Step.Head(40), error.step)
         assertEquals(BedError.CommandFailed("head stopped at 25%, target 40%"), error.error)
         assertEquals(listOf("move head 40", "stop"), ops.commands, "confirmed stop after a failure; foot and firmness never sent")
-        assertTrue(error.userMessage.contains("Head to 40%"))
-        assertTrue(error.userMessage.contains("stopped (confirmed by the bed)"))
+        assertEquals(
+            "Reading did not finish: The bed refused the command: head stopped at 25%, target 40% (at \"Head to 40%\"). The bed was told to stop.",
+            error.userMessage,
+        )
+    }
+
+    @Test
+    fun actuatorFaultAfterTheHeadSetSendsStopAndReportsIt() = runTest {
+        val ops = FakeOps(head = 0)
+        ops.faultAfterStart = true
+        val error = assertFailsWith<FavoriteApplyException> { applier().apply(favorite, ops, {}) }
+        assertEquals(listOf("move head 40", "stop"), ops.commands)
+        assertTrue(error.userMessage.endsWith("The bed was told to stop."))
     }
 
     @Test

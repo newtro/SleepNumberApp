@@ -17,8 +17,11 @@ object CommandGates {
         val moving: Boolean,
     )
 
+    // Same wording as the iOS app.
     const val NOT_CONNECTED = "Not connected to the bed."
     const val WAIT_FOR_MOVEMENT = "Wait for the current movement to finish."
+    const val WAIT_FOR_COMMAND = "Wait for the current command or firmness change to finish, or press STOP."
+    const val WAIT_FOR_BED_TO_STOP = "Wait for the bed to stop moving, or press STOP."
 
     /** Why a preset / firmness / light command cannot run now, or null. */
     fun commandBlocker(s: State): String? = when {
@@ -28,13 +31,15 @@ object CommandGates {
         else -> null
     }
 
-    /** Why Apply is unavailable right now, or null. Refuses while our own move or pump work is active. */
+    /**
+     * Why Apply is unavailable right now, or null (docs/FAVORITES-SPEC.md §1.4, iOS order and wording).
+     * Refuses while our own move or pump work is active or the bed reports motion.
+     */
     fun applyBlocker(s: State): String? = when {
         !s.connected -> NOT_CONNECTED
-        s.holdActive || s.moving -> WAIT_FOR_MOVEMENT
-        s.applyingFavorite -> "A favorite is already being applied."
-        s.commandsInFlight > 0 -> "Wait for the current command to finish."
-        s.adjustingFirmness -> "Wait for the firmness adjustment to finish (or press STOP)."
+        s.holdActive || s.applyingFavorite -> WAIT_FOR_MOVEMENT
+        s.commandsInFlight > 0 || s.adjustingFirmness -> WAIT_FOR_COMMAND
+        s.moving -> WAIT_FOR_BED_TO_STOP
         else -> null
     }
 }

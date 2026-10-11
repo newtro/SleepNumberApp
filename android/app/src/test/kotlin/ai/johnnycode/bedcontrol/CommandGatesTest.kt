@@ -14,11 +14,12 @@ class CommandGatesTest {
     fun applyAllowedOnlyWhenIdle() {
         assertNull(CommandGates.applyBlocker(idle))
         assertEquals(CommandGates.NOT_CONNECTED, CommandGates.applyBlocker(idle.copy(connected = false)))
-        assertEquals(CommandGates.WAIT_FOR_MOVEMENT, CommandGates.applyBlocker(idle.copy(moving = true)))
+        assertEquals(CommandGates.WAIT_FOR_BED_TO_STOP, CommandGates.applyBlocker(idle.copy(moving = true)))
         assertEquals(CommandGates.WAIT_FOR_MOVEMENT, CommandGates.applyBlocker(idle.copy(holdActive = true)))
-        assertNotNull(CommandGates.applyBlocker(idle.copy(applyingFavorite = true)))
-        assertNotNull(CommandGates.applyBlocker(idle.copy(commandsInFlight = 1)))
-        assertNotNull(CommandGates.applyBlocker(idle.copy(adjustingFirmness = true)))
+        assertEquals(CommandGates.WAIT_FOR_MOVEMENT, CommandGates.applyBlocker(idle.copy(applyingFavorite = true)))
+        assertEquals(CommandGates.WAIT_FOR_COMMAND, CommandGates.applyBlocker(idle.copy(commandsInFlight = 1)))
+        assertEquals(CommandGates.WAIT_FOR_COMMAND, CommandGates.applyBlocker(idle.copy(adjustingFirmness = true)))
+        assertEquals(CommandGates.NOT_CONNECTED, CommandGates.applyBlocker(idle.copy(connected = false, moving = true)))
     }
 
     @Test

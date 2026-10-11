@@ -62,14 +62,20 @@ class FavoriteApplyException(
     val error: BedError,
     val stop: StopOutcome?,
 ) : Exception(error.message, error) {
-    /** What actually happened, for the UI. */
+    /** STOP pressed elsewhere dropped the apply's next request: a cancellation, not a failure. */
+    val isCancellation: Boolean get() = error == BedError.Cancelled
+
+    /** What actually happened, for the UI (docs/FAVORITES-SPEC.md §2.3 wording). */
     val userMessage: String
         get() = buildString {
-            append(if (error == BedError.Cancelled) "\"$favoriteName\" was stopped" else "\"$favoriteName\" failed")
-            step?.let { append(" at \"${it.title}\"") }
-            if (error != BedError.Cancelled) append(": ${error.message}")
-            stop?.let { append(". ${it.summary}") }
+            append("$favoriteName did not finish: ${error.message.trimEnd('.')}")
+            step?.let { append(" (at \"${it.title}\")") }
             append(".")
+            when (stop) {
+                is StopOutcome.Confirmed -> append(" The bed was told to stop.")
+                is StopOutcome.Unconfirmed -> append(" The bed was told to stop, but the stop could not be confirmed — check the bed and press STOP.")
+                null -> Unit
+            }
         }
 }
 

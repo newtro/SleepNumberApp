@@ -716,13 +716,17 @@ class BedController(app: Application) : AndroidViewModel(app) {
                 }, onStopped = { stop = it })
                 log.info("Favorites", "applied \"${favorite.name}\"")
             } catch (e: CancellationException) {
-                val message = "\"${favorite.name}\" was cancelled${if (lastStep.isNotEmpty()) " during \"$lastStep\"" else ""}" +
-                    (stop?.let { ". ${it.summary}." } ?: ". Nothing was moving yet.")
-                log.info("Favorites", message)
-                banner = message
+                // A cancellation is not shown as an error; only an unconfirmed stop needs the user.
+                log.info("Favorites", "apply cancelled${if (lastStep.isNotEmpty()) " during \"$lastStep\"" else ""}${stop?.let { "; ${it.summary}" } ?: ""}")
+                if (stop is StopOutcome.Unconfirmed) banner = "${favorite.name}: ${stop!!.summary}."
             } catch (e: FavoriteApplyException) {
-                log.error("Favorites", e.userMessage)
-                banner = e.userMessage
+                if (e.isCancellation) {
+                    log.info("Favorites", "apply cancelled by STOP")
+                    if (e.stop is StopOutcome.Unconfirmed) banner = "${favorite.name}: ${e.stop!!.summary}."
+                } else {
+                    log.error("Favorites", "apply failed: ${e.userMessage}")
+                    banner = e.userMessage
+                }
             } catch (e: Exception) {
                 log.error("Favorites", "apply failed: ${e.message}")
                 banner = "\"${favorite.name}\" failed: ${e.message}"

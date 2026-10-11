@@ -41,7 +41,8 @@ class FavoritesStore(filesDir: File) {
     }
 
     private fun moveAside(target: File, why: String): String {
-        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+        // ISO 8601 with ':' replaced by '-', as in iOS (docs/FAVORITES-SPEC.md §1.2).
+        val stamp = java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString().replace(":", "-")
         val aside = File(directory, target.nameWithoutExtension + ".unreadable-$stamp.json")
         val moved = target.renameTo(aside)
         return if (moved) "Saved favorites $why. The file was kept as ${aside.name} and the list starts empty."
