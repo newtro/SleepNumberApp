@@ -83,6 +83,23 @@ class MCRSessionTest {
     }
 
     @Test
+    fun macFallbackBindAcceptsRepliesWithZeroSourceEcho() = runTest {
+        val e = env(macFallback = 0x05D3)
+        e.link.responder = { data, _ ->
+            val frame = MCRFrame.decode(data)
+            if (frame.functionCode == 0) {
+                listOf(MCRFrame(command = 1, destination = 0, status = 1, function = 0x80, side = 0, payload = List(8) { 0 } + listOf(0xA1, 0xB2)).encoded())
+            } else {
+                // Addressed to us, but the bed leaves its own address 0.
+                listOf(MCRFrame(command = 1, destination = client, status = 1, function = 0x80 or frame.functionCode, side = 0, payload = listOf(0, 35, 50)).encoded())
+            }
+        }
+        val bound = e.session.performBind()
+        assertTrue(bound.bedAddressFromMac)
+        assertEquals(50, e.session.readPumpStatus().sleepNumber(MCRWireSide.ONE))
+    }
+
+    @Test
     fun requestsBeforeBindAreRefused() = runTest {
         val e = env()
         assertEquals(BedError.NotConnected, assertFailsWith<BedError> { e.session.readPumpStatus() })

@@ -53,6 +53,8 @@ class MCRRequest internal constructor(
     val side: Int,
     val payload: List<Int> = emptyList(),
     val label: String,
+    /** Stop frames are never dropped by the session's stop generation check. */
+    val isStop: Boolean = false,
 ) {
     init {
         if (side !in 0..0x0F || payload.size > MCRFrame.MAX_PAYLOAD) {
@@ -145,7 +147,7 @@ object MCRCommands {
     fun readPumpStatus() = MCRRequest(MCRNode.PUMP, MCRFunction.READ, 0, label = "Read pump")
 
     /** Interrupts a firmness adjustment in progress (`ForceIdleCall`). */
-    fun pumpForceIdle() = MCRRequest(MCRNode.PUMP, MCRFunction.FORCE_IDLE, 0, label = "Pump idle")
+    fun pumpForceIdle() = MCRRequest(MCRNode.PUMP, MCRFunction.FORCE_IDLE, 0, label = "Pump idle", isStop = true)
 
     /** Starts a firmness adjustment on one side (`SetSleepNumberCall`). */
     fun setSleepNumber(side: MCRWireSide, value: Int): MCRRequest {
@@ -181,14 +183,14 @@ object MCRCommands {
     }
 
     /** Sleep Expert short write: key (4 ASCII) + value, node 0x52 cmd 0x1B. */
-    internal fun sleepExpertWrite(key: String, value: String, label: String): MCRRequest {
+    internal fun sleepExpertWrite(key: String, value: String, label: String, isStop: Boolean = false): MCRRequest {
         val keyBytes = key.toByteArray(Charsets.UTF_8)
         val valueBytes = value.toByteArray(Charsets.UTF_8)
         if (keyBytes.size != 4 || keyBytes.size + valueBytes.size > MCRFrame.MAX_PAYLOAD) {
             throw BedError.InvalidArgument("Sleep Expert key must be 4 bytes and fit 15 with its value")
         }
         val payload = (keyBytes + valueBytes).map { it.toInt() and 0xFF }
-        return MCRRequest(MCRNode.SLEEP_EXPERT, MCRFunction.SE_SHORT_WRITE, 0, payload, label)
+        return MCRRequest(MCRNode.SLEEP_EXPERT, MCRFunction.SE_SHORT_WRITE, 0, payload, label, isStop)
     }
 
     /** Side letter in Sleep Expert keys: R for side 0 (right), L for side 1 (left). */
@@ -197,7 +199,7 @@ object MCRCommands {
     /** Stops foundation movement on one side (`StopFoundationMovementCall`): MFHR/MFHL = "110". */
     fun stopMotion(side: MCRWireSide): MCRRequest {
         val key = "MFH" + keyLetter(side)
-        return sleepExpertWrite(key, "110", "Stop $key")
+        return sleepExpertWrite(key, "110", "Stop $key", isStop = true)
     }
 
     /** Absolute position (`SetFoundationPositionCall`): MFU[R|L] (head) or MFF[R|L] (foot) = "<pos>_0". */

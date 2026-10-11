@@ -12,14 +12,16 @@ data class MCRBindResult(
     val bedAddress: Int,
     /** Our assigned address: reply payload bytes 8-9. Goes in the source fields. */
     val clientAddress: Int,
+    /** True when the bed address came from the MAC because the reply's source was 0. */
+    val bedAddressFromMac: Boolean = false,
 ) {
     companion object {
         /** `macFallback` (last two MAC octets) is used only if the reply's source field is zero. */
         fun parse(reply: MCRFrame, macFallback: Int? = null): MCRBindResult {
             val client = if (reply.payload.size >= 10) (reply.payload[8] shl 8) or reply.payload[9] else 0
-            val bed = listOf(reply.source, macFallback ?: 0).firstOrNull { it != 0 }
-                ?: throw BedError.MalformedResponse("bind reply carried no bed address")
-            return MCRBindResult(bed, client)
+            if (reply.source != 0) return MCRBindResult(reply.source, client)
+            val mac = macFallback?.takeIf { it != 0 } ?: throw BedError.MalformedResponse("bind reply carried no bed address")
+            return MCRBindResult(mac, client, bedAddressFromMac = true)
         }
     }
 }

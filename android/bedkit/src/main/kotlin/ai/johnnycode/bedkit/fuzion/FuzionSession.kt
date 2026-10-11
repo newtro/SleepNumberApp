@@ -99,12 +99,15 @@ class FuzionSession(
 
     // MARK: Commands
 
-    /** Sends one command and returns its PASS argument tokens. */
-    suspend fun send(command: FuzionCommand, generation: Long? = null): List<String> {
+    /**
+     * Sends one command and returns its PASS argument tokens.
+     * @param isStop halts (ACHA, PSNI) are never dropped by the stop generation check.
+     */
+    suspend fun send(command: FuzionCommand, generation: Long? = null, isStop: Boolean = false): List<String> {
         val gen = generation ?: stopGeneration
         return mutex.withLock {
             currentCoroutineContext().ensureActive()
-            if (gen != stopGeneration) {
+            if (gen != stopGeneration && !isStop) {
                 log(FrameEvent(FrameEvent.Direction.INFO, "BamKey", text = "dropped ${command.key}: STOP was pressed after it was queued"))
                 throw BedError.Cancelled
             }

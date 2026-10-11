@@ -167,7 +167,7 @@ class MCRSession(
         matches: (MCRFrame) -> Boolean,
     ): MCRFrame = mutex.withLock {
         currentCoroutineContext().ensureActive()
-        if (generation != null && generation != stopGeneration) {
+        if (generation != null && generation != stopGeneration && !request.isStop) {
             log(FrameEvent(FrameEvent.Direction.INFO, "MCR", text = "dropped ${request.label}: STOP was pressed after it was queued"))
             throw BedError.Cancelled
         }
@@ -292,7 +292,8 @@ class MCRSession(
                 frame.command and 0xF0 != request.node.raw and 0xF0
             ) return false
             if (frame.destination == 0) return true
-            return frame.destination == bind.clientAddress && frame.sourceEcho == bind.bedAddress
+            val fromBed = frame.sourceEcho == bind.bedAddress || (bind.bedAddressFromMac && frame.sourceEcho == 0)
+            return frame.destination == bind.clientAddress && fromBed
         }
     }
 }
