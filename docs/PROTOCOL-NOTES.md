@@ -128,3 +128,49 @@ Saved per-side favorites are specified in `docs/FAVORITES-SPEC.md`.
     favorites reads only the favorite's own side (`SNCG`), and single-chamber beds map both sides
     to `right`; favorites send the foot with the favorite's side and ignore the foot picker. Both
     are open items in `docs/FAVORITES-SPEC.md` §4.
+
+## Android (android/)
+
+The Android app is a Kotlin + Jetpack Compose port. `android/bedkit` is a pure-JVM port of BedKit
+plus the drivers and favorites (tested against the iOS vectors and a simulated MCR bed);
+`android/app` holds the BLE transport, controller and UI. It follows the same protocol choices as
+iOS, including everything in the Unverified list above. Android-specific behaviour:
+
+- Bed identity is the Bluetooth MAC address (also the MCR bind MAC fallback and the favorites
+  file key). After a ready link drops, reconnect uses Android's background auto-connect, which
+  stays pending until the bed is back in range.
+- One GATT operation at a time (`GattOpQueue`). An operation is registered only after Android
+  accepted it. MCR with-response writes time out after 1.5 s; the timed-out operation's late reply
+  is owed (no time limit) and is discarded when it arrives, so it can never complete a later
+  operation. While a reply is owed, a new operation (the stall stop) keeps retrying for up to 2 s
+  until the late reply frees the stack. On any timeout the controller gets up to 6 s to send its
+  stop sequence before the link is dropped.
+- Fuzion requests MTU 517 and bonds before reading Auth (30 s for the user to accept pairing).
+  Chunks are MTU-4, or MTU-5 on Android 14+, as in the official app.
+- Leaving the app releases a hold and cancels a favorite with a confirmed stop. There is no
+  foreground service, so a favorite does not keep running in the background. A rotation does not
+  cancel a running favorite, but it does release a hold: the hold button leaves the screen and
+  its release runs (intended; the finger is off the button).
+
+### Deferred from the Android review (low severity)
+
+6. **A finished favorite job can clear a newer run's state.** The apply's `finally` resets
+   `applyingFavorite`/`favoriteJob` without a run id. It needs teardown, reconnect and a new Apply
+   inside one confirmed stop (a few seconds); STOP still works through the stop generation.
+7. **Write-stall stop and retries.** The stall stop now also covers in-flight commands and a busy
+   pump. Not done: MCR's timeout retry can still re-send a stalled preset inside the stop window
+   before the link drops. The stop sequence that follows still goes out.
+8. **The 3 s / 2 s stop budgets cannot cut a stop short.** `stopAll` runs under NonCancellable,
+   so with a bad radio Disconnect or choosing another bed can wait about 30 s. Kept deliberately:
+   finishing the stop matters more than leaving quickly. A deadline inside `stopConfirmed` would
+   be the fix.
+9. **Hold buttons stay locked during a slow confirmed release.** `activeHold` stays set until the
+   release's stop and status read finish. Commands say "Release the movement button first";
+   STOP still works. A separate "releasing" state would give a clearer message.
+10. **No quick retry after GATT status 133.** A first direct-connect failure shows Offline and
+    retries after 5 s instead of immediately.
+11. **The 6 s stall budget cannot cut the stall stop short** (re-review). `BleManager.linkBroken`
+    wraps the controller's stop in a 6 s timeout, but `stopAll`/`stopConfirmed` run under
+    NonCancellable, so on a dead link the stop sequence spends about 9-10 s on refused starts while
+    the link stays open and shows Ready. Android's own link-loss disconnect caps it, and STOP is
+    not blocked. Same fix as item 8: pass an explicit deadline into `stopConfirmed`.
