@@ -225,6 +225,9 @@ The value has no leading zeros or padding: `0_0`, `7_0`, `35_0`, `100_0`.
 
 ## 4. Open items
 
+Verified 2026-10-10: saving and applying favorites works on the owner's 360 p6 / FlexFit 2 (MCR).
+The items below are about cases that test didn't cover.
+
 - **Foot side for favorites.** The apply sends the foot with the favorite's own side. The main
   screen's foot control has an "As Left / As Right" picker (`footSide`) that favorites ignore.
   On a split-head base the firmware is expected to drive the shared foot either way; if a real
