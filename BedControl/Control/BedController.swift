@@ -49,6 +49,19 @@ final class BedController {
     private(set) var lastUpdated: Date?
     var banner: String?
 
+    struct FavoriteRun: Equatable {
+        let side: BedSide
+        let favorite: BedFavorite
+        var status: String
+        var stepIndex: Int
+        var stepCount: Int
+    }
+
+    /// Saved favorites for the current bed.
+    private(set) var favorites = FavoritesDocument(bedID: "none")
+    /// The favorite being applied, with live progress.
+    private(set) var applyingFavorite: FavoriteRun?
+
     var swapSides: Bool {
         didSet {
             UserDefaults.standard.set(swapSides, forKey: Keys.swapSides)
@@ -69,11 +82,12 @@ final class BedController {
     @ObservationIgnored private var pollTask: Task<Void, Never>?
     @ObservationIgnored private var holdTask: Task<Void, Never>?
     @ObservationIgnored private var holdID = 0
+    @ObservationIgnored private var favoriteTask: Task<Void, Never>?
     @ObservationIgnored private var commandTasks: [Int: Task<Void, Never>] = [:]
     @ObservationIgnored private var nextCommandID = 0
     @ObservationIgnored private var reconnectTask: Task<Void, Never>?
     @ObservationIgnored private var pollCycle = 0
-    @ObservationIgnored private var firmnessSentAt: Date?
+    @ObservationIgnored private var firmnessAckAt: Date?
     @ObservationIgnored private var autoReconnect = true
     @ObservationIgnored private var pendingConnectName: String?
 
@@ -104,7 +118,13 @@ final class BedController {
         ble.onReady = { [weak self] kind in self?.linkReady(kind) }
         ble.onDisconnect = { [weak self] error in self?.linkLost(error) }
         ble.onNotification = { [weak self] characteristic, data in self?.driver?.handleNotification(characteristic, data) }
+        ble.onWriteStall = { [weak self] in
+            guard let self, let driver = self.driver, self.activeHold != nil || self.moving else { return }
+            self.holdTask?.cancel()
+            Task { try? await driver.stopAll() }
+        }
         phase = savedBed == nil ? .noBed : .searching(savedBed?.name ?? "bed")
+        reloadFavorites()
     }
 
     /// The official app's persisted random 64-bit MCR client ID, created once.
@@ -143,13 +163,16 @@ final class BedController {
 
     /// Connects to a device picked from the scan list and remembers it.
     func choose(_ device: ScannedDevice) {
-        stopMotionBeforeLeaving()
-        tearDownDriver()
-        ble.disconnect()
-        let bed = SavedBed(id: device.id, name: device.name, lastProtocol: device.classification.likelyProtocol)
-        save(bed)
-        autoReconnect = true
-        connect(id: device.id, name: device.name)
+        autoReconnect = false
+        Task {
+            await stopMotionBeforeLeaving()
+            tearDownDriver()
+            ble.disconnect()
+            let bed = SavedBed(id: device.id, name: device.name, lastProtocol: device.classification.likelyProtocol)
+            save(bed)
+            autoReconnect = true
+            connect(id: device.id, name: device.name)
+        }
     }
 
     func retry() {
@@ -162,24 +185,40 @@ final class BedController {
     func disconnect() {
         autoReconnect = false
         reconnectTask?.cancel()
-        stopMotionBeforeLeaving()
-        tearDownDriver()
-        ble.disconnect()
-        phase = savedBed == nil ? .noBed : .failed("Disconnected. Tap Retry to reconnect.")
+        Task {
+            await stopMotionBeforeLeaving()
+            tearDownDriver()
+            ble.disconnect()
+            phase = savedBed == nil ? .noBed : .failed("Disconnected. Tap Retry to reconnect.")
+        }
     }
 
     func forgetBed() {
-        disconnect()
-        savedBed = nil
-        UserDefaults.standard.removeObject(forKey: Keys.savedBed)
-        phase = .noBed
+        autoReconnect = false
+        Task {
+            await stopMotionBeforeLeaving()
+            tearDownDriver()
+            ble.disconnect()
+            savedBed = nil
+            UserDefaults.standard.removeObject(forKey: Keys.savedBed)
+            reloadFavorites()
+            phase = .noBed
+        }
     }
 
-    /// Best-effort stop frames before dropping the link while something may be moving.
-    private func stopMotionBeforeLeaving() {
-        guard let driver, activeHold != nil || moving || pumpBusy else { return }
+    /// Sends (and waits up to 3 s for) the stop sequence before the link is dropped, if
+    /// anything may be moving or pumping.
+    private func stopMotionBeforeLeaving() async {
+        guard let driver, activeHold != nil || moving || pumpBusy || applyingFavorite != nil else { return }
         holdTask?.cancel()
-        Task { try? await driver.stopAll() }
+        favoriteTask?.cancel()
+        let stop = Task { try? await driver.stopAll() }
+        let timeout = Task {
+            try? await Task.sleep(for: .seconds(3))
+            stop.cancel()
+        }
+        _ = await stop.value
+        timeout.cancel()
     }
 
     private func connect(id: UUID, name: String) {
@@ -195,7 +234,9 @@ final class BedController {
     }
 
     private func save(_ bed: SavedBed) {
+        let changed = savedBed?.id != bed.id
         savedBed = bed
+        if changed { reloadFavorites() }
         if let data = try? JSONEncoder().encode(bed) {
             UserDefaults.standard.set(data, forKey: Keys.savedBed)
         }
@@ -286,6 +327,9 @@ final class BedController {
     }
 
     private func tearDownDriver() {
+        favoriteTask?.cancel()
+        favoriteTask = nil
+        applyingFavorite = nil
         holdTask?.cancel()
         holdTask = nil
         activeHold = nil
@@ -305,7 +349,7 @@ final class BedController {
         pollCycle = 0
         pollTask = Task {
             while !Task.isCancelled {
-                if activeHold == nil {
+                if activeHold == nil && applyingFavorite == nil {
                     await refreshNow()
                     processFirmnessQueue()
                 }
@@ -322,9 +366,10 @@ final class BedController {
     func refreshNow() async {
         guard let driver, phase == .ready else { return }
         pollCycle += 1
+        let started = Date()
         do {
             let reading = try await driver.refresh(includeLight: pollCycle % 3 == 1)
-            apply(reading)
+            apply(reading, pollStarted: started)
             lastUpdated = Date()
         } catch BedError.cancelled {
         } catch {
@@ -332,14 +377,22 @@ final class BedController {
         }
     }
 
-    private func apply(_ reading: BedReading) {
+    private func apply(_ reading: BedReading, pollStarted: Date? = nil) {
         for (side, value) in reading.firmness {
             firmness[side] = value
         }
         if let busy = reading.pumpBusy {
             pumpBusy = busy
-            // The app waits 1 s after a set, then polls until the pump is idle.
-            let settled = firmnessSentAt.map { Date().timeIntervalSince($0) > 1.5 } ?? true
+            // The app waits 1 s after the bed acknowledges a set, then polls until idle. Only a
+            // poll that started at least 1 s after the acknowledgement may end the adjustment.
+            let settled: Bool
+            if adjustingSide == nil {
+                settled = true
+            } else if let ack = firmnessAckAt, let pollStarted {
+                settled = pollStarted.timeIntervalSince(ack) >= 1
+            } else {
+                settled = false
+            }
             if !busy && settled {
                 if let side = adjustingSide {
                     log.info("App", "\(side.title) firmness adjustment finished")
@@ -365,6 +418,10 @@ final class BedController {
         }
         guard activeHold == nil else {
             banner = "Release the movement button first."
+            return
+        }
+        guard applyingFavorite == nil else {
+            banner = "A favorite is being applied. Press STOP to cancel it first."
             return
         }
         nextCommandID += 1
@@ -430,10 +487,11 @@ final class BedController {
         queuedFirmness[side] = nil
         adjustingSide = side
         pumpBusy = true
-        firmnessSentAt = Date()
+        firmnessAckAt = nil
         perform("Firmness \(value) (\(side.title))") { driver in
             do {
                 try await driver.setFirmness(value, side: side, interruptRunning: interrupt)
+                self.firmnessAckAt = Date()
             } catch {
                 if self.adjustingSide == side { self.adjustingSide = nil }
                 throw error
@@ -460,6 +518,10 @@ final class BedController {
             return
         }
         guard activeHold == nil else { return }
+        guard applyingFavorite == nil else {
+            banner = "A favorite is being applied. Press STOP to cancel it first."
+            return
+        }
         let key = HoldKey(axis: axis, side: side, direction: direction)
         activeHold = key
         moving = true
@@ -501,6 +563,7 @@ final class BedController {
 
     func stopEverything() {
         log.info("App", "STOP pressed")
+        favoriteTask?.cancel()
         holdTask?.cancel()
         cancelCommands()
         queuedFirmness.removeAll()
@@ -510,12 +573,123 @@ final class BedController {
         Task {
             do {
                 try await driver.stopAll()
+            } catch BedError.cancelled {
             } catch {
                 banner = "STOP could not be sent: \(error.localizedDescription)"
             }
             try? await Task.sleep(for: .milliseconds(500))
             await refreshNow()
         }
+    }
+
+    // MARK: Favorites
+
+    private func reloadFavorites() {
+        favorites = FavoritesStore.load(bedID: savedBed?.id.uuidString ?? "none")
+    }
+
+    private func persistFavorites() {
+        do {
+            try FavoritesStore.save(favorites)
+        } catch {
+            banner = "Could not save favorites: \(error.localizedDescription)"
+            log.error("Favorites", "save failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// A new favorite pre-filled with live values read from the bed (falls back to the last
+    /// known values if the read fails).
+    func captureFavorite(for side: BedSide) async -> BedFavorite {
+        await refreshNow()
+        let count = favorites[side].count + 1
+        return BedFavorite(name: "\(side.title) \(count)",
+                           head: head[side] ?? 0,
+                           foot: foot[side] ?? foot[side.other] ?? 0,
+                           sleepNumber: firmness[side] ?? 50)
+    }
+
+    func saveFavorite(_ favorite: BedFavorite, side: BedSide) {
+        if !favorites.update(favorite, on: side) { favorites.add(favorite, to: side) }
+        persistFavorites()
+        log.info("Favorites", "saved \(side.title) \"\(favorite.name)\" head \(favorite.head) foot \(favorite.foot) SN \(favorite.sleepNumber)")
+    }
+
+    func deleteFavorite(_ id: UUID, side: BedSide) {
+        favorites.delete(id: id, from: side)
+        persistFavorites()
+    }
+
+    func moveFavorites(side: BedSide, from offsets: IndexSet, to destination: Int) {
+        favorites.move(on: side, fromOffsets: offsets, toOffset: destination)
+        persistFavorites()
+    }
+
+    /// Applies a favorite: head, foot, then firmness, with progress. STOP cancels it.
+    func applyFavorite(_ favorite: BedFavorite, side: BedSide) {
+        guard let driver, phase == .ready else {
+            banner = "Not connected to the bed."
+            return
+        }
+        guard activeHold == nil, applyingFavorite == nil else {
+            banner = "Wait for the current movement to finish."
+            return
+        }
+        queuedFirmness.removeAll()
+        adjustingSide = nil
+        let ops = driver.favoriteOps(for: side)
+        let applier = FavoriteApplier()
+        applyingFavorite = FavoriteRun(side: side, favorite: favorite, status: "Starting…", stepIndex: 0, stepCount: 3)
+        log.info("Favorites", "apply \(side.title) \"\(favorite.name)\"")
+        favoriteTask = Task {
+            let background = UIApplication.shared.beginBackgroundTask(withName: "Apply favorite")
+            defer { if background != .invalid { UIApplication.shared.endBackgroundTask(background) } }
+            do {
+                try await applier.apply(favorite, ops: ops) { progress in
+                    self.handle(progress, side: side)
+                }
+                log.info("Favorites", "applied \"\(favorite.name)\"")
+            } catch let error where FavoriteApplier.isCancellation(error) {
+                log.info("Favorites", "apply cancelled")
+            } catch {
+                let message = (error as? BedError)?.localizedDescription ?? error.localizedDescription
+                log.error("Favorites", "apply failed: \(message)")
+                banner = "\(favorite.name) stopped: \(message)"
+            }
+            applyingFavorite = nil
+            favoriteTask = nil
+            await refreshNow()
+        }
+    }
+
+    /// Cancels the favorite being applied (sends the side's stop).
+    func cancelFavorite() {
+        favoriteTask?.cancel()
+    }
+
+    private func handle(_ progress: FavoriteApplier.Progress, side: BedSide) {
+        guard var run = applyingFavorite else { return }
+        switch progress {
+        case .step(let index, let count, let step):
+            run.stepIndex = index
+            run.stepCount = count
+            run.status = step.title
+        case .moving(let step, let current):
+            run.status = "\(step.title): now \(current)%"
+            if case .head = step { head[side] = current } else { foot[side] = current }
+            moving = true
+        case .skipped(let step):
+            run.status = "\(step.title): already there"
+        case .waitingForPump:
+            run.status = "Waiting for the pump to finish the other side…"
+        case .adjusting(let step, let current):
+            run.status = "\(step.title): now \(current)"
+            firmness[side] = current
+            pumpBusy = true
+        case .finished:
+            run.status = "Done"
+            moving = false
+        }
+        applyingFavorite = run
     }
 
     // MARK: Diagnostics

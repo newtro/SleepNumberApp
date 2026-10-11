@@ -11,6 +11,9 @@ struct ControlView: View {
                 if let banner = controller.banner {
                     BannerView(text: banner) { controller.banner = nil }
                 }
+                if let run = controller.applyingFavorite {
+                    FavoriteProgressCard(run: run)
+                }
                 HStack(alignment: .top, spacing: 12) {
                     SidePanel(side: .left)
                     SidePanel(side: .right)
@@ -112,6 +115,7 @@ private struct BannerView: View {
 private struct SidePanel: View {
     @Environment(BedController.self) private var controller
     let side: BedSide
+    @State private var showFavorites = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -161,7 +165,18 @@ private struct SidePanel: View {
                     .accessibilityLabel("\(option.accessibilityName), \(side.title) side")
                 }
             }
+
+            Button {
+                showFavorites = true
+            } label: {
+                Label("My favorites (\(controller.favorites[side].count))", systemImage: "heart.text.square")
+                    .font(.footnote.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .accessibilityLabel("\(side.title) side saved favorites")
         }
+        .sheet(isPresented: $showFavorites) { FavoritesView(side: side) }
         .padding(12)
         .frame(maxWidth: .infinity)
         .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
