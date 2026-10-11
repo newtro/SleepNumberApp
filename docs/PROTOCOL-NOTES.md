@@ -97,13 +97,10 @@ Saved per-side favorites are specified in `docs/FAVORITES-SPEC.md`.
 
 ## Unverified
 
-1. **Dead-man behaviour of MCR holds.** The APK spec infers that the foundation keeps moving
-   only while the keep-adjusting polls arrive. If not, the bed would run toward 100/0 until the
-   stop key arrives. The app always sends the stop on release, on STOP, when backgrounded and
-   before disconnecting, but whether the bed stops by itself if the phone dies mid-hold is
-   untested. **Test before relying on it:** start a hold, switch the phone to airplane mode,
-   and check the bed stops within about a second. If it does not, holds should go back to
-   bounded targets (current ±15, extended as each is reached) using the same cmd `0x11`.
+1. **Dead-man behaviour of MCR holds — VERIFIED 2026-10-10** on the owner's 360 p6 / FlexFit 2
+   (iPhone app): airplane mode during a held head-up stopped the bed immediately. The foundation
+   moves only while the keep-adjusting polls arrive, so full-travel hold targets (100/0, as in
+   the official app) are safe if the phone drops mid-hold.
 2. **`MFHx = "110"` as the stop.** Static analysis only; its meaning is unknown. The earlier
    BedRemote foundation ForceIdle (`0x42` cmd `0x02`) is not sent because the app never uses it.
 3. **Left foot on a split-head base.** The app sends foot moves with either side; the spec
