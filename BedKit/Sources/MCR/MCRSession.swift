@@ -270,6 +270,28 @@ public final class MCRSession {
         if let firstError { throw firstError }
     }
 
+    /// Stops the given sides, then reads foundation status and re-sends the stop (up to 3
+    /// attempts) while it still reports motion. Never throws; returns the last status read.
+    /// Call it from a task that is not cancelled (the status reads honour cancellation).
+    @discardableResult
+    public func stopFoundationConfirmed(sides: [MCRWireSide] = MCRWireSide.allCases) async -> MCRFoundationStatus? {
+        var last: MCRFoundationStatus?
+        for attempt in 1...3 {
+            do {
+                try await stopFoundation(sides: sides)
+            } catch {
+                log(FrameEvent(.error, channel: "MCR", text: "stop attempt \(attempt) failed: \(error.localizedDescription)"))
+            }
+            try? await Task.sleep(for: .milliseconds(300))
+            if let frame = try? await send(try MCRCommands.readFoundationStatus(), generation: stopGeneration) {
+                last = try? MCRFoundationStatus.parse(frame)
+            }
+            if let last, !last.moving { return last }
+            log(FrameEvent(.error, channel: "MCR", text: "foundation still moving (or unreadable) after stop attempt \(attempt)"))
+        }
+        return last
+    }
+
     /// Interrupts a firmness adjustment immediately.
     public func stopPump() async throws {
         stopGeneration &+= 1

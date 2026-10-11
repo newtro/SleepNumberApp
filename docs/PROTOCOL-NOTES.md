@@ -124,3 +124,7 @@ Saved per-side favorites are specified in `docs/FAVORITES-SPEC.md`.
 10. **Fuzion urgent `ACHA`** is written outside the request queue so STOP never waits; queued
     commands are dropped by the stop generation, but a command already waiting for its
     "response ready" hint could consume ACHA's hint (logging only).
+11. **Deferred from the favorites review (owner's bed is MCR):** the Fuzion pump-busy rule for
+    favorites reads only the favorite's own side (`SNCG`), and single-chamber beds map both sides
+    to `right`; favorites send the foot with the favorite's side and ignore the foot picker. Both
+    are open items in `docs/FAVORITES-SPEC.md` §4.

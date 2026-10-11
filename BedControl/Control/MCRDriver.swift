@@ -149,23 +149,10 @@ final class MCRDriver: BedDriver {
         if let firstError { throw firstError }
     }
 
-    /// Sends the stop key, then checks the foundation; re-sends while it still reports motion.
+    /// The session's confirmed stop (stop key, status check, re-send while moving).
     @discardableResult
     private func stopConfirmed(sides: [MCRWireSide]) async -> BedReading? {
-        var last: MCRFoundationStatus?
-        for attempt in 1...3 {
-            do {
-                try await session.stopFoundation(sides: sides)
-            } catch {
-                log.error("MCR", "stop attempt \(attempt) failed: \(error.localizedDescription)")
-            }
-            try? await Task.sleep(for: .milliseconds(300))
-            last = try? await session.send(try MCRCommands.readFoundationStatus(), generation: session.stopGeneration)
-                .flatMapStatus()
-            if let last, !last.moving { break }
-            log.error("MCR", "foundation still moving after stop attempt \(attempt)")
-        }
-        guard let last else { return nil }
+        guard let last = await session.stopFoundationConfirmed(sides: sides) else { return nil }
         var reading = BedReading()
         apply(last, to: &reading)
         return reading
@@ -194,8 +181,4 @@ final class MCRDriver: BedDriver {
         }
         reading.moving = status.moving
     }
-}
-
-private extension MCRFrame {
-    func flatMapStatus() throws -> MCRFoundationStatus { try MCRFoundationStatus.parse(self) }
 }

@@ -224,6 +224,7 @@ private struct FirmnessControl: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .disabled(controller.applyingFavorite != nil || controller.activeHold != nil)
             } else if controller.queuedFirmness[side] != nil {
                 Button("Cancel queued", role: .destructive) { controller.cancelQueuedFirmness(side) }
                     .controlSize(.small)

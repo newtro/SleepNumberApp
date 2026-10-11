@@ -13,7 +13,12 @@ struct BedControlApp: App {
         }
         .onChange(of: scenePhase) { _, phase in
             // Never leave a held movement running when the app leaves the foreground.
-            if phase != .active { controller.endHold() }
+            if phase == .background {
+                controller.endHold()
+                controller.cancelFavorite()
+            } else if phase != .active {
+                controller.endHold()
+            }
             if phase == .active { Task { await controller.refreshNow() } }
         }
     }

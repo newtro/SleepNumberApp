@@ -148,21 +148,8 @@ final class FuzionDriver: BedDriver {
         if let firstError { throw firstError }
     }
 
-    /// ACHA written immediately, then through the queue until PASS, then re-sent while ACTM
-    /// still reports movement (the app sends ACHA through its mutex; this does both).
     private func haltConfirmed() async {
-        do { try await session.sendUrgent(.haltAllActuators()) } catch { log.error("Fuzion", "urgent halt failed: \(error.localizedDescription)") }
-        for attempt in 1...3 {
-            do {
-                try await session.send(.haltAllActuators(), isStop: true)
-                try? await Task.sleep(for: .milliseconds(300))
-                let movement = try FuzionMovementStatus.parse(try await session.send(.actuatorMovementStatus(), isStop: true))
-                if !movement.any { return }
-                log.error("Fuzion", "still moving after halt attempt \(attempt)")
-            } catch {
-                log.error("Fuzion", "halt attempt \(attempt) failed: \(error.localizedDescription)")
-            }
-        }
+        await session.haltConfirmed()
     }
 
     func favoriteOps(for side: BedSide) -> FavoriteBedOps {

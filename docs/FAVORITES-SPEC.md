@@ -59,8 +59,11 @@ and `-` stripped from the file name. Writes are atomic.
 ```
 
 - `left` / `right` are ordered arrays; the order is the display order.
-- `version` is 1. A reader must reject a file whose version is higher than it supports. An
-  unreadable or missing file means "no favorites" for that bed.
+- `version` is 1. A missing file means "no favorites" for that bed.
+- A file that exists but cannot be read (corrupt JSON, or a `version` higher than supported)
+  must **never be overwritten**: rename it to `<name>.unreadable-<timestamp>.json` (timestamp
+  ISO 8601 with `:` replaced by `-`), log it, tell the user where it went, and start from an
+  empty list.
 
 ### 1.3 Operations
 
@@ -75,6 +78,21 @@ and `-` stripped from the file name. Writes are atomic.
 - **Reorder**: standard list move (move the items at the given offsets to before the
   destination index).
 - **Apply**: an explicit "Apply" tap only. Nothing ever applies a favorite automatically.
+
+### 1.4 When Apply is allowed
+
+Apply is refused, with a message and **without changing any state**, when any of these hold:
+
+- the bed is not connected and ready;
+- a press-and-hold move is active, or another favorite is being applied;
+- a command the app sent is still in flight (preset, light, firmness set);
+- the app's own firmness change is still running (it started one and the pump has not yet
+  reported idle);
+- the last foundation status said the bed is moving ("wait for the bed to stop, or press STOP").
+
+When Apply starts, queued firmness requests for either side are dropped (the favorite sets this
+side's firmness itself) and their pending target values are cleared. While a favorite runs,
+polling, holds, presets, the light, and firmness Set are all refused the same way.
 
 ## 2. Apply sequence
 
@@ -131,20 +149,42 @@ loop:
     wait 1000 ms
 ```
 
-### 2.3 Cancellation (STOP or Cancel)
+### 2.3 Ending a step early: cancellation, errors, stops
 
-The STOP button stays available throughout. Pressing it or the progress card's Cancel:
+**Which stop is sent.** Once a move step has sent its SET-POSITION, any way out of that step
+other than reaching the target sends **STOP(side) confirmed**:
 
-- stops the sequence immediately; no further step starts;
-- during a move step sends STOP(side) for the favorite's side;
-- during the firmness step, if the set was already sent, sends PUMP-IDLE;
-- the global STOP additionally runs the normal stop-everything sequence (both sides' stop keys,
-  pump idle) and invalidates every queued request, so a request the sequence had already queued
-  can never reach the bed after STOP (iOS: the session "stop generation" captured when the apply
-  starts; any request carrying an older generation is dropped).
+- cancellation (STOP button, the progress card's Cancel, the app going to the background, or
+  background time expiring);
+- any error: move timeout, stopped short, a status read failing, an actuator fault,
+  needs-homing, a NACK.
 
-Any step failure (timeout, stopped short, NACK, actuator fault, needs-homing) ends the sequence
-and is shown to the user. Steps that already completed are not undone.
+Once the firmness step has *started sending* SET-SLEEP-NUMBER (marked before the request is
+sent, so a cancel while the set is in flight counts), any way out other than "pump idle" sends
+**PUMP-IDLE**. Before a SET is sent, ending the step sends nothing.
+
+**STOP(side) confirmed** = up to 3 attempts of: send the side's stop key immediately (bypassing
+the request queue) and again through the queue; wait 300 ms; read foundation status; finish as
+soon as the status says not moving. Fuzion: `ACHA` immediately, `ACHA` through the queue until
+`PASS`, wait 300 ms, `ACTM`; repeat while anything moves (up to 3).
+
+**The stop always runs to completion.** It runs in a fresh task that does not inherit the
+cancellation of the apply, so a cancelled apply still gets its queued and confirmed stop frames
+and status reads. (iOS: `FavoriteApplier.uncancelled`.)
+
+**Nothing queued survives STOP.** The global STOP bumps the session's stop generation. Every
+request the apply issues carries the generation captured when the apply began, and a request
+with an older generation is dropped before it reaches the wire. Stop frames and pump-idle are
+exempt, so overlapping stops never cancel each other. The global STOP also runs the normal
+stop-everything sequence (both sides confirmed, pump idle).
+
+**Backgrounding.** When the app goes to the background the running favorite is cancelled (with
+the stop above), the same as a held move. The apply also runs under an OS background task whose
+expiry handler cancels it, so the OS never suspends the app mid-move without a stop.
+
+**Reporting.** Any failure ends the sequence. Steps already completed are not undone. The user
+sees "<name> did not finish: <reason>. The bed was told to stop." A cancellation is not shown
+as an error.
 
 While a favorite is being applied, polling, hold-to-move, presets and firmness changes are
 blocked, with a message pointing at STOP. Progress is shown as "Step i of 3: <status>" with live
@@ -183,7 +223,17 @@ The value has no leading zeros or padding: `0_0`, `7_0`, `35_0`, `100_0`.
 | Read pump | `SNCG <side>` → `adjusting ambient user`; busy = `adjusting == 1`, SN = `user` |
 | PUMP-IDLE | `PSNI` |
 
-## 4. Test vectors to reproduce
+## 4. Open items
+
+- **Foot side for favorites.** The apply sends the foot with the favorite's own side. The main
+  screen's foot control has an "As Left / As Right" picker (`footSide`) that favorites ignore.
+  On a split-head base the firmware is expected to drive the shared foot either way; if a real
+  bed only accepts one side, favorites should use `footSide`. Untested on hardware.
+- **Fuzion pump rule.** On Fuzion, `busy` comes from `SNCG` of the favorite's side only, and a
+  single-chamber bed maps both sides to `right`. Whether the other side's adjustment shows as
+  busy there is unverified (the owner's bed is MCR).
+
+## 5. Test vectors to reproduce
 
 From `BedKit/Tests/FavoritesTests.swift`:
 
@@ -193,6 +243,12 @@ From `BedKit/Tests/FavoritesTests.swift`:
 - Start head 0, foot 50; apply head 40, foot 20, SN 65 → commands in order: move head 40,
   move foot 20, Sleep Number 65.
 - Values already within tolerance (head 41 vs 40, same foot and SN) → no commands sent.
-- Cancel during the head move → commands: move head, STOP; foot and firmness never sent.
+- Cancel during the head move → commands: move head, STOP; foot and firmness never sent; the
+  STOP ran in a task that was not cancelled.
+- Actuator fault on a status read after the head SET → move head, STOP; error reported.
+- Head stops short at 30 (target 60) → move head, STOP; error "head stopped at 30%".
 - Cancel after the firmness set → the last command is PUMP-IDLE.
+- Cancel while the firmness set itself is still in flight → set, PUMP-IDLE.
+- MCR confirmed stop where the first status read says moving and the second says stopped →
+  stop key sent 4 times (immediate + queued, twice), 2 status reads.
 - STOP pressed before a queued SET-POSITION is sent → the SET-POSITION never reaches the wire.

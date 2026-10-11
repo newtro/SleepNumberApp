@@ -17,12 +17,27 @@ enum FavoritesStore {
         return try directory().appendingPathComponent("\(safe.isEmpty ? "bed" : safe).json")
     }
 
-    static func load(bedID: String) -> FavoritesDocument {
-        guard let url = try? url(for: bedID), let data = try? Data(contentsOf: url),
-              let document = try? FavoritesDocument.decode(data) else {
-            return FavoritesDocument(bedID: bedID)
+    /// Loads the bed's favorites. A missing file means none. A file that exists but cannot be
+    /// read (corrupt, or written by a newer app version) is renamed to
+    /// `<name>.unreadable-<timestamp>.json` so the next save can never overwrite it; the
+    /// returned message says where it went.
+    static func load(bedID: String) -> (document: FavoritesDocument, problem: String?) {
+        let empty = FavoritesDocument(bedID: bedID)
+        guard let url = try? url(for: bedID), FileManager.default.fileExists(atPath: url.path) else {
+            return (empty, nil)
         }
-        return document
+        do {
+            return (try FavoritesDocument.decode(try Data(contentsOf: url)), nil)
+        } catch {
+            let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+            let aside = url.deletingPathExtension().appendingPathExtension("unreadable-\(stamp).json")
+            do {
+                try FileManager.default.moveItem(at: url, to: aside)
+                return (empty, "Saved favorites could not be read (\(error.localizedDescription)). The file was kept as \(aside.lastPathComponent).")
+            } catch let moveError {
+                return (empty, "Saved favorites could not be read or moved aside: \(moveError.localizedDescription)")
+            }
+        }
     }
 
     static func save(_ document: FavoritesDocument) throws {

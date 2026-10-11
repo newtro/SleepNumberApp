@@ -83,6 +83,11 @@ class FakeFavoriteOps: FavoriteBedOps {
     var stallAt: [FoundationAxis: Int] = [:]
     var calls: [String] = []
     var onRead: (() -> Void)?
+    /// Records Task.isCancelled at the moment each stop ran (stops must run uncancelled).
+    var stopRanCancelled: [Bool] = []
+    var faultOnRead: Int?
+    var reads = 0
+    var slowSet: Duration?
 
     func startMove(_ axis: FoundationAxis, to position: Int) async throws {
         calls.append("move \(axis.rawValue) \(position)")
@@ -91,6 +96,8 @@ class FakeFavoriteOps: FavoriteBedOps {
 
     func readPosition(_ axis: FoundationAxis) async throws -> (position: Int, moving: Bool) {
         onRead?()
+        reads += 1
+        if let faultOnRead, reads == faultOnRead { throw BedError.commandFailed("head actuator: motor current high") }
         guard let target = targets[axis], let current = positions[axis] else { return (positions[axis] ?? 0, false) }
         if let stall = stallAt[axis], current == stall { return (current, false) }
         if current == target { targets[axis] = nil; return (current, false) }
@@ -99,10 +106,14 @@ class FakeFavoriteOps: FavoriteBedOps {
         return (next, next != target)
     }
 
-    func stopMove() async { calls.append("stopMove") }
+    func stopMove() async {
+        stopRanCancelled.append(Task.isCancelled)
+        calls.append("stopMove")
+    }
 
     func startSleepNumber(_ value: Int) async throws {
         calls.append("sleepNumber \(value)")
+        if let slowSet { try await Task.sleep(for: slowSet) }
         sleepNumber = value
         pumpBusyPolls = max(pumpBusyPolls, 2)
     }
@@ -113,7 +124,10 @@ class FakeFavoriteOps: FavoriteBedOps {
         return (sleepNumber, false)
     }
 
-    func stopPump() async { calls.append("stopPump") }
+    func stopPump() async {
+        stopRanCancelled.append(Task.isCancelled)
+        calls.append("stopPump")
+    }
 }
 
 @MainActor
@@ -172,7 +186,8 @@ final class FavoriteApplierTests: XCTestCase {
         } catch {
             guard case .commandFailed = error as? BedError else { return XCTFail("\(error)") }
         }
-        XCTAssertEqual(ops.calls, ["move head 60"])
+        // Any failure after the SET also sends the side's stop (spec §2.3).
+        XCTAssertEqual(ops.calls, ["move head 60", "stopMove"])
     }
 
     func testCancellationDuringMoveStopsAndSkipsRemainingSteps() async throws {
@@ -191,6 +206,38 @@ final class FavoriteApplierTests: XCTestCase {
             XCTAssertTrue(FavoriteApplier.isCancellation(error), "\(error)")
         }
         XCTAssertEqual(ops.calls, ["move head 90", "stopMove"])
+        XCTAssertEqual(ops.stopRanCancelled, [false], "the stop must run outside the cancelled task (H2)")
+    }
+
+    func testFaultAfterMoveStartedStillStopsTheSide() async {
+        // M2: an error other than cancellation after the SET (e.g. actuator fault) must stop.
+        let ops = FakeFavoriteOps()
+        ops.faultOnRead = 3
+        do {
+            try await applier.apply(BedFavorite(name: "X", head: 90, foot: 40, sleepNumber: 70), ops: ops) { _ in }
+            XCTFail()
+        } catch {
+            guard case .commandFailed = error as? BedError else { return XCTFail("\(error)") }
+        }
+        XCTAssertEqual(ops.calls, ["move head 90", "stopMove"])
+        XCTAssertEqual(ops.stopRanCancelled, [false])
+    }
+
+    func testCancelWhileTheSetIsInFlightStillIdlesThePump() async throws {
+        // M1: cancellation during the set exchange itself must send PUMP-IDLE.
+        let ops = FakeFavoriteOps()
+        ops.slowSet = .seconds(5)
+        let task = Task { try await self.applier.apply(BedFavorite(name: "X", head: 0, foot: 0, sleepNumber: 30), ops: ops) { _ in } }
+        while !ops.calls.contains("sleepNumber 30") { await Task.yield() }
+        task.cancel()
+        do {
+            try await task.value
+            XCTFail()
+        } catch {
+            XCTAssertTrue(FavoriteApplier.isCancellation(error), "\(error)")
+        }
+        XCTAssertEqual(ops.calls, ["sleepNumber 30", "stopPump"])
+        XCTAssertEqual(ops.stopRanCancelled, [false])
     }
 
     func testCancellationDuringFirmnessInterruptsThePump() async throws {
@@ -212,6 +259,7 @@ final class FavoriteApplierTests: XCTestCase {
             XCTAssertTrue(FavoriteApplier.isCancellation(error), "\(error)")
         }
         XCTAssertEqual(ops.calls.last, "stopPump")
+        XCTAssertEqual(ops.stopRanCancelled, [false])
     }
 
     func testMoveTimeoutStopsTheSide() async {
@@ -264,6 +312,31 @@ final class FavoriteOpsWireTests: XCTestCase {
         let set = try MCRFrame.decode(link.writes.last!.data)
         XCTAssertEqual([set.command, set.functionCode, set.side], [0x02, 0x11, 1])
         XCTAssertEqual(set.payload, [0, 45])
+    }
+
+    func testMCRFavoriteStopIsConfirmedAndResentWhileMoving() async throws {
+        // H2: the favorite's stop is the confirmed stop: status is read and the key re-sent
+        // while the foundation still reports motion.
+        let link = FakeLink()
+        let session = try await boundSession(link)
+        var statusReads = 0
+        link.responder = { data, _ in
+            let frame = try! MCRFrame.decode(data)
+            var payload: [UInt8] = []
+            if frame.command == 0x42 && frame.functionCode == 0x12 {
+                statusReads += 1
+                payload = [statusReads < 2 ? 0x43 : 0x42, 10, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            }
+            return [try! MCRFrame(command: frame.command - 1, source: 0x32D3, destination: 0xA1B2, status: frame.command - 1,
+                                  sourceEcho: 0x32D3, function: 0x80 | frame.functionCode, side: frame.side, payload: payload).encoded]
+        }
+        let ops = MCRFavoriteOps(session: session, side: .one)
+        let before = link.writes.count
+        await ops.stopMove()
+        let frames = link.writes.dropFirst(before).compactMap { try? MCRFrame.decode($0.data) }
+        let stops = frames.filter { $0.command == 0x52 }.map { String(decoding: $0.payload, as: UTF8.self) }
+        XCTAssertEqual(stops, ["MFHL110", "MFHL110", "MFHL110", "MFHL110"], "two attempts: urgent + confirmed each")
+        XCTAssertEqual(statusReads, 2)
     }
 
     func testFavoriteOpsStopWorkingAfterStop() async throws {

@@ -35,11 +35,13 @@ final class BedController {
     private(set) var savedBed: SavedBed?
     private(set) var protocolKind: BedProtocol?
     private(set) var firmness: [BedSide: Int] = [:]
-    private(set) var pumpBusy = false
+    /// One-side-at-a-time firmness state (pure, tested in BedKit).
+    private(set) var firmnessQueue = FirmnessScheduler()
+    var pumpBusy: Bool { firmnessQueue.pumpBusy }
     /// Side whose firmness change this app started and is still running.
-    private(set) var adjustingSide: BedSide?
-    private(set) var queuedFirmness: [BedSide: Int] = [:]
-    private(set) var requestedFirmness: [BedSide: Int] = [:]
+    var adjustingSide: BedSide? { firmnessQueue.adjustingSide }
+    var queuedFirmness: [BedSide: Int] { firmnessQueue.queued }
+    var requestedFirmness: [BedSide: Int] { firmnessQueue.requested }
     private(set) var head: [BedSide: Int] = [:]
     private(set) var foot: [BedSide: Int] = [:]
     private(set) var lightOn: Bool?
@@ -87,7 +89,6 @@ final class BedController {
     @ObservationIgnored private var nextCommandID = 0
     @ObservationIgnored private var reconnectTask: Task<Void, Never>?
     @ObservationIgnored private var pollCycle = 0
-    @ObservationIgnored private var firmnessAckAt: Date?
     @ObservationIgnored private var autoReconnect = true
     @ObservationIgnored private var pendingConnectName: String?
 
@@ -338,8 +339,7 @@ final class BedController {
         cancelCommands()
         driver?.reset()
         driver = nil
-        queuedFirmness.removeAll()
-        adjustingSide = nil
+        firmnessQueue.clear(includingRunning: true)
     }
 
     // MARK: Polling
@@ -382,23 +382,10 @@ final class BedController {
             firmness[side] = value
         }
         if let busy = reading.pumpBusy {
-            pumpBusy = busy
-            // The app waits 1 s after the bed acknowledges a set, then polls until idle. Only a
-            // poll that started at least 1 s after the acknowledgement may end the adjustment.
-            let settled: Bool
-            if adjustingSide == nil {
-                settled = true
-            } else if let ack = firmnessAckAt, let pollStarted {
-                settled = pollStarted.timeIntervalSince(ack) >= 1
-            } else {
-                settled = false
-            }
-            if !busy && settled {
-                if let side = adjustingSide {
-                    log.info("App", "\(side.title) firmness adjustment finished")
-                    requestedFirmness[side] = nil
-                }
-                adjustingSide = nil
+            // An adjustment ends only on an idle reading from a poll that started >= 1 s after
+            // the bed acknowledged the set (see FirmnessScheduler).
+            if let finished = firmnessQueue.pumpReading(busy: busy, pollStarted: pollStarted ?? .distantPast) {
+                log.info("App", "\(finished.title) firmness adjustment finished")
             }
         }
         for (side, value) in reading.head { head[side] = value }
@@ -412,18 +399,11 @@ final class BedController {
 
     /// Runs a command as a tracked task so STOP can cancel it.
     private func perform(_ label: String, _ action: @escaping (BedDriver) async throws -> Void) {
-        guard let driver, phase == .ready else {
-            banner = "Not connected to the bed."
+        if let reason = commandBlockedReason {
+            banner = reason
             return
         }
-        guard activeHold == nil else {
-            banner = "Release the movement button first."
-            return
-        }
-        guard applyingFavorite == nil else {
-            banner = "A favorite is being applied. Press STOP to cancel it first."
-            return
-        }
+        guard let driver else { return }
         nextCommandID += 1
         let id = nextCommandID
         commandTasks[id] = Task {
@@ -470,44 +450,59 @@ final class BedController {
     /// Requests a firmness change. The pump serves one side at a time, so a request waits while
     /// the pump is busy with the other side (or with an adjustment this app did not start).
     /// A new value for the side already adjusting interrupts and replaces it, as the app does.
+    /// Why a command cannot be sent right now, or nil if it can.
+    private var commandBlockedReason: String? {
+        if driver == nil || phase != .ready { return "Not connected to the bed." }
+        if activeHold != nil { return "Release the movement button first." }
+        if applyingFavorite != nil { return "A favorite is being applied. Press STOP to cancel it first." }
+        return nil
+    }
+
     func setFirmness(_ value: Int, side: BedSide) {
-        let normalized = SleepNumber.normalize(value)
-        requestedFirmness[side] = normalized
-        if adjustingSide == side {
-            sendFirmness(normalized, side: side, interrupt: true)
-        } else if pumpBusy || adjustingSide != nil {
-            queuedFirmness[side] = normalized
-            log.info("App", "\(side.title) firmness \(normalized) queued until the pump is idle")
-        } else {
-            sendFirmness(normalized, side: side, interrupt: false)
+        // Guards are checked before any state changes (a refused request leaves no trace).
+        switch firmnessQueue.request(value, side: side, blockedReason: commandBlockedReason) {
+        case .refused(let reason):
+            banner = reason
+        case .queued:
+            log.info("App", "\(side.title) firmness \(firmnessQueue.queued[side] ?? value) queued until the pump is idle")
+        case .send(let side, let value, let interrupt):
+            sendFirmness(value, side: side, interrupt: interrupt)
         }
     }
 
+    /// Sends a set the scheduler has already marked as sending.
     private func sendFirmness(_ value: Int, side: BedSide, interrupt: Bool) {
-        queuedFirmness[side] = nil
-        adjustingSide = side
-        pumpBusy = true
-        firmnessAckAt = nil
-        perform("Firmness \(value) (\(side.title))") { driver in
+        guard let driver else {
+            firmnessQueue.sendFailed(side: side)
+            return
+        }
+        nextCommandID += 1
+        let id = nextCommandID
+        commandTasks[id] = Task {
+            defer { commandTasks[id] = nil }
             do {
                 try await driver.setFirmness(value, side: side, interruptRunning: interrupt)
-                self.firmnessAckAt = Date()
+                firmnessQueue.acknowledged(side: side)
             } catch {
-                if self.adjustingSide == side { self.adjustingSide = nil }
-                throw error
+                firmnessQueue.sendFailed(side: side)
+                if !FavoriteApplier.isCancellation(error) {
+                    let message = (error as? BedError)?.localizedDescription ?? error.localizedDescription
+                    log.error("App", "firmness \(value) (\(side.title)) failed: \(message)")
+                    banner = "Firmness \(value) (\(side.title)) failed: \(message)"
+                }
             }
         }
     }
 
     private func processFirmnessQueue() {
-        guard !queuedFirmness.isEmpty, !pumpBusy, adjustingSide == nil else { return }
-        let side: BedSide = queuedFirmness[.left] != nil ? .left : .right
-        if let value = queuedFirmness[side] { sendFirmness(value, side: side, interrupt: false) }
+        guard commandBlockedReason == nil else { return }
+        if case .send(let side, let value, let interrupt) = firmnessQueue.nextQueued() {
+            sendFirmness(value, side: side, interrupt: interrupt)
+        }
     }
 
     func cancelQueuedFirmness(_ side: BedSide) {
-        queuedFirmness[side] = nil
-        requestedFirmness[side] = nil
+        firmnessQueue.cancelQueued(side: side)
     }
 
     // MARK: Press and hold
@@ -566,9 +561,7 @@ final class BedController {
         favoriteTask?.cancel()
         holdTask?.cancel()
         cancelCommands()
-        queuedFirmness.removeAll()
-        requestedFirmness.removeAll()
-        adjustingSide = nil
+        firmnessQueue.clear(includingRunning: true)
         guard let driver else { return }
         Task {
             do {
@@ -585,7 +578,12 @@ final class BedController {
     // MARK: Favorites
 
     private func reloadFavorites() {
-        favorites = FavoritesStore.load(bedID: savedBed?.id.uuidString ?? "none")
+        let loaded = FavoritesStore.load(bedID: savedBed?.id.uuidString ?? "none")
+        favorites = loaded.document
+        if let problem = loaded.problem {
+            log.error("Favorites", problem)
+            banner = problem
+        }
     }
 
     private func persistFavorites() {
@@ -634,14 +632,27 @@ final class BedController {
             banner = "Wait for the current movement to finish."
             return
         }
-        queuedFirmness.removeAll()
-        adjustingSide = nil
+        guard commandTasks.isEmpty, adjustingSide == nil else {
+            banner = "Wait for the current command or firmness change to finish, or press STOP."
+            return
+        }
+        guard !moving else {
+            banner = "Wait for the bed to stop moving, or press STOP."
+            return
+        }
+        // Queued firmness requests are dropped: the favorite sets this side's firmness itself.
+        firmnessQueue.clear(includingRunning: false)
         let ops = driver.favoriteOps(for: side)
         let applier = FavoriteApplier()
         applyingFavorite = FavoriteRun(side: side, favorite: favorite, status: "Starting…", stepIndex: 0, stepCount: 3)
         log.info("Favorites", "apply \(side.title) \"\(favorite.name)\"")
         favoriteTask = Task {
-            let background = UIApplication.shared.beginBackgroundTask(withName: "Apply favorite")
+            // If iOS is about to suspend the app, cancel (which sends a confirmed stop) rather
+            // than be killed mid-move.
+            let background = UIApplication.shared.beginBackgroundTask(withName: "Apply favorite") {
+                self.log.info("Favorites", "background time expiring; cancelling the favorite")
+                self.cancelFavorite()
+            }
             defer { if background != .invalid { UIApplication.shared.endBackgroundTask(background) } }
             do {
                 try await applier.apply(favorite, ops: ops) { progress in
@@ -653,7 +664,8 @@ final class BedController {
             } catch {
                 let message = (error as? BedError)?.localizedDescription ?? error.localizedDescription
                 log.error("Favorites", "apply failed: \(message)")
-                banner = "\(favorite.name) stopped: \(message)"
+                // Any failure after a move or set started has already told the bed to stop.
+                banner = "\(favorite.name) did not finish: \(message). The bed was told to stop."
             }
             applyingFavorite = nil
             favoriteTask = nil
@@ -684,7 +696,7 @@ final class BedController {
         case .adjusting(let step, let current):
             run.status = "\(step.title): now \(current)"
             firmness[side] = current
-            pumpBusy = true
+            firmnessQueue.setPumpBusy(true)
         case .finished:
             run.status = "Done"
             moving = false

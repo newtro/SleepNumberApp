@@ -122,7 +122,8 @@ public protocol FavoriteBedOps: AnyObject {
     func startMove(_ axis: FoundationAxis, to position: Int) async throws
     /// Current position of the axis on this side, and whether the foundation reports motion.
     func readPosition(_ axis: FoundationAxis) async throws -> (position: Int, moving: Bool)
-    /// Stops this side's movement (sent when an apply is cancelled or times out).
+    /// Stops this side's movement and confirms it (sent when an apply is cancelled or fails
+    /// after a move started). The applier calls it from a non-cancelled task.
     func stopMove() async
     /// Starts a firmness change on this side.
     func startSleepNumber(_ value: Int) async throws
@@ -213,6 +214,7 @@ public final class FavoriteApplier {
             progress(.skipped(step))
             return
         }
+        // From here on, any way out other than reaching the target stops the side.
         do {
             try await ops.startMove(axis, to: target)
             let clock = ContinuousClock()
@@ -232,14 +234,18 @@ public final class FavoriteApplier {
                     }
                 }
                 if clock.now >= deadline {
-                    await ops.stopMove()
                     throw BedError.timeout("\(axis.rawValue) did not reach \(target)%")
                 }
             }
         } catch {
-            if FavoriteApplier.isCancellation(error) { await ops.stopMove() }
+            await FavoriteApplier.uncancelled { await ops.stopMove() }
             throw error
         }
+    }
+
+    /// Runs cleanup in a fresh task so the caller's cancellation cannot suppress it.
+    static func uncancelled(_ work: @escaping @MainActor () async -> Void) async {
+        await Task { @MainActor in await work() }.value
     }
 
     private func firmness(_ target: Int, step: Step, ops: FavoriteBedOps,
@@ -260,10 +266,11 @@ public final class FavoriteApplier {
             progress(.skipped(step))
             return
         }
+        // Marked before the await: a cancel while the set is in flight may still have reached the bed.
         var started = false
         do {
-            try await ops.startSleepNumber(target)
             started = true
+            try await ops.startSleepNumber(target)
             try await Task.sleep(for: timing.pumpStartDelay)
             let deadline = clock.now + timing.pumpTimeout
             while true {
@@ -274,7 +281,7 @@ public final class FavoriteApplier {
                 try await Task.sleep(for: timing.pumpPoll)
             }
         } catch {
-            if started && FavoriteApplier.isCancellation(error) { await ops.stopPump() }
+            if started { await FavoriteApplier.uncancelled { await ops.stopPump() } }
             throw error
         }
     }
@@ -317,7 +324,7 @@ public final class MCRFavoriteOps: FavoriteBedOps {
     }
 
     public func stopMove() async {
-        try? await session.stopFoundation(sides: [side])
+        await session.stopFoundationConfirmed(sides: [side])
     }
 
     public func startSleepNumber(_ value: Int) async throws {
@@ -362,7 +369,7 @@ public final class FuzionFavoriteOps: FavoriteBedOps {
     }
 
     public func stopMove() async {
-        try? await session.sendUrgent(.haltAllActuators())
+        await session.haltConfirmed()
     }
 
     public func startSleepNumber(_ value: Int) async throws {

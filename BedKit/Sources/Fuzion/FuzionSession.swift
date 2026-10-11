@@ -139,6 +139,25 @@ public final class FuzionSession {
         try await link.write(command.frame, to: .fuzionBamKey)
     }
 
+    /// ACHA written immediately, then through the queue until PASS, then re-sent while ACTM
+    /// still reports movement (up to 3 attempts). Never throws. Call from a non-cancelled task.
+    public func haltConfirmed() async {
+        do { try await sendUrgent(.haltAllActuators()) } catch {
+            log(FrameEvent(.error, channel: "BamKey", text: "urgent halt failed: \(error.localizedDescription)"))
+        }
+        for attempt in 1...3 {
+            do {
+                try await send(.haltAllActuators(), isStop: true)
+                try? await Task.sleep(for: .milliseconds(300))
+                let movement = try FuzionMovementStatus.parse(try await send(.actuatorMovementStatus(), isStop: true))
+                if !movement.any { return }
+                log(FrameEvent(.error, channel: "BamKey", text: "still moving after halt attempt \(attempt)"))
+            } catch {
+                log(FrameEvent(.error, channel: "BamKey", text: "halt attempt \(attempt) failed: \(error.localizedDescription)"))
+            }
+        }
+    }
+
     private func waitForHint(label: String) async throws {
         if hintArrived {
             hintArrived = false
