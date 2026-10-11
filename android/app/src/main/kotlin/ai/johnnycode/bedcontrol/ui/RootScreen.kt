@@ -26,6 +26,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -40,12 +42,28 @@ sealed class Screen {
     data object Diagnostics : Screen()
     data object Settings : Screen()
     data class Favorites(val side: BedSide) : Screen()
+
+    companion object {
+        /** Keeps the current screen across rotation / process recreation. */
+        val Saver: Saver<Screen, String> = Saver(
+            save = { if (it is Favorites) "favorites:${it.side.name}" else it::class.simpleName },
+            restore = { saved ->
+                when {
+                    saved.startsWith("favorites:") -> BedSide.entries.firstOrNull { it.name == saved.substringAfter(":") }?.let { Favorites(it) } ?: Main
+                    saved == "Scan" -> Scan
+                    saved == "Diagnostics" -> Diagnostics
+                    saved == "Settings" -> Settings
+                    else -> Main
+                }
+            },
+        )
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun RootScreen(controller: BedController) {
-    var screen by remember { mutableStateOf<Screen>(Screen.Main) }
+    var screen by rememberSaveable(stateSaver = Screen.Saver) { mutableStateOf<Screen>(Screen.Main) }
     if (screen != Screen.Main) BackHandler { screen = Screen.Main }
     val noBed = controller.savedBed == null
     val title = when (val s = screen) {
@@ -90,6 +108,7 @@ fun RootScreen(controller: BedController) {
                 },
             )
         },
+        bottomBar = { if (!noBed) SafetyBar(controller) },
     ) { padding ->
         when (val s = screen) {
             Screen.Main -> if (noBed) ScanScreen(controller, padding, onChosen = {}) else ControlScreen(controller, padding, onFavorites = { screen = Screen.Favorites(it) })

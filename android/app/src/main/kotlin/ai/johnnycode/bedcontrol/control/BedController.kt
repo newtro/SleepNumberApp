@@ -159,12 +159,13 @@ class BedController(app: Application) : AndroidViewModel(app) {
         ble.onReady = { linkReady(it) }
         ble.onDisconnect = { linkLost(it) }
         ble.onNotification = { c, data -> driver?.handleNotification(c, data) }
-        ble.onWriteStall = {
+        ble.onLinkStall = {
+            // The link stays open until this returns: get the stop out before it is dropped.
             val d = driver
-            if (d != null && (activeHold != null || moving || applyingFavorite != null)) {
+            if (d != null && (activeHold != null || moving || pumpBusy || applyingFavorite != null)) {
                 holdJob?.cancel()
                 favoriteJob?.cancel()
-                viewModelScope.launch { runCatching { d.stopAll() } }
+                runCatching { d.stopAll() }
             }
         }
         phase = savedBed?.let { Phase.Searching(it.name) } ?: Phase.NoBed
@@ -453,13 +454,18 @@ class BedController(app: Application) : AndroidViewModel(app) {
 
     // MARK: Commands
 
+    private val gateState: CommandGates.State
+        get() = CommandGates.State(
+            connected = driver != null && phase == Phase.Ready,
+            holdActive = activeHold != null,
+            applyingFavorite = applyingFavorite != null,
+            commandsInFlight = commandsInFlight,
+            adjustingFirmness = adjustingSide != null,
+            moving = moving,
+        )
+
     /** Why a new command cannot run now, or null if it can. Checked before any state is changed. */
-    private fun commandBlocker(): String? = when {
-        driver == null || phase != Phase.Ready -> "Not connected to the bed."
-        activeHold != null -> "Release the movement button first."
-        applyingFavorite != null -> "A favorite is being applied. Press STOP to cancel it first."
-        else -> null
-    }
+    private fun commandBlocker(): String? = CommandGates.commandBlocker(gateState)
 
     /** Runs a command as a tracked job so STOP can cancel it. Callers check [commandBlocker] first. */
     private fun perform(label: String, onFailure: () -> Unit = {}, action: suspend (BedDriver) -> Unit) {
@@ -686,14 +692,7 @@ class BedController(app: Application) : AndroidViewModel(app) {
     }
 
     /** Why Apply is unavailable right now, or null. */
-    fun applyBlocker(): String? = when {
-        driver == null || phase != Phase.Ready -> "Not connected to the bed."
-        activeHold != null -> "Release the movement button first."
-        applyingFavorite != null -> "A favorite is already being applied."
-        commandsInFlight > 0 -> "Wait for the current command to finish."
-        adjustingSide != null -> "Wait for the firmness adjustment to finish (or press STOP)."
-        else -> null
-    }
+    fun applyBlocker(): String? = CommandGates.applyBlocker(gateState)
 
     /** Applies a favorite: head, foot, then firmness, with progress. STOP or Cancel stops it (confirmed). */
     fun applyFavorite(favorite: Favorite, side: BedSide) {
@@ -782,20 +781,28 @@ class BedController(app: Application) : AndroidViewModel(app) {
 
     @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
     override fun onCleared() {
+        // No reconnects or callbacks into a cleared controller.
+        autoReconnect = false
+        reconnectJob?.cancel()
+        ble.onAdapterChange = null
+        ble.onReady = null
+        ble.onDisconnect = null
+        ble.onLinkStall = null
         val d = driver
-        val busy = activeHold != null || moving || applyingFavorite != null
+        val busy = activeHold != null || moving || pumpBusy || applyingFavorite != null
         holdJob?.cancel()
         favoriteJob?.cancel()
+        pollJob?.cancel()
         if (d != null && busy) {
-            // viewModelScope is already cancelled: send the stop from an app-lifetime scope, then disconnect.
+            // viewModelScope is already cancelled: send the stop from an app-lifetime scope, then close.
             kotlinx.coroutines.GlobalScope.launch(kotlinx.coroutines.Dispatchers.Main) {
-                withTimeoutOrNull(2_000) { runCatching { d.stopAll() } }
+                withTimeoutOrNull(3_000) { runCatching { d.stopAll() } }
                 d.reset()
-                ble.disconnect()
+                ble.close()
             }
         } else {
-            tearDownDriver()
-            ble.disconnect()
+            d?.reset()
+            ble.close()
         }
         super.onCleared()
     }

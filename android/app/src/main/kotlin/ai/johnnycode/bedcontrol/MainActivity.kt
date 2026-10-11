@@ -117,11 +117,13 @@ private fun PermissionGate(onGranted: () -> Unit, content: @Composable () -> Uni
 @Composable
 private fun LifecycleHooks(controller: BedController) {
     val owner = LocalLifecycleOwner.current
+    val activity = LocalContext.current as? android.app.Activity
     DisposableEffect(owner) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 // Never leave a held movement or a favorite running when the app leaves the foreground.
-                Lifecycle.Event.ON_STOP -> controller.onBackground()
+                // A rotation also stops the activity; that is not leaving the app.
+                Lifecycle.Event.ON_STOP -> if (activity?.isChangingConfigurations != true) controller.onBackground()
                 Lifecycle.Event.ON_START -> {
                     controller.ble.refreshAdapterState()
                     controller.refresh()

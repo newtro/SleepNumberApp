@@ -64,11 +64,10 @@ enum class AdapterState { UNKNOWN, ON, OFF, UNSUPPORTED }
  * notification routing. Implements bedkit's [BedLink]; all protocol logic lives in bedkit.
  *
  * Android's GATT allows one outstanding operation, so every write chunk, read, descriptor write, MTU
- * request and discovery goes through [gattOp], which holds a mutex until the operation's callback
- * arrives. An operation always waits for its own callback (bounded by a timeout) even when the caller
- * is cancelled, so a late callback can never complete the next operation; a missing callback means the
- * link is broken and it is dropped. Whole frames are serialized by [frameMutex], so chunks of two frames
- * never interleave.
+ * request and discovery goes through [GattOpQueue] (one at a time, each paired with its callback; a
+ * timed-out operation's late callback is discarded). A missing callback means the link is unreliable:
+ * the controller gets a chance to send its stop sequence, then the link is dropped. Whole frames are
+ * serialized by [frameMutex], so chunks of two frames never interleave.
  *
  * Everything runs on the main thread: GATT callbacks (binder threads) are posted to it. Callers must
  * hold the Bluetooth permissions before using it (MainActivity gates the UI on them).
@@ -107,8 +106,11 @@ class BleManager(
     var onDisconnect: ((BedError?) -> Unit)? = null
     var onNotification: ((BedCharacteristic, ByteArray) -> Unit)? = null
 
-    /** Called when a write stalls, just before the link is dropped, so the controller can try a stop. */
-    var onWriteStall: (() -> Unit)? = null
+    /**
+     * Called when an operation stalls, before the link is dropped, so the controller can send its stop
+     * sequence; the link stays open until this returns (at most [STALL_STOP_BUDGET_MS]).
+     */
+    var onLinkStall: (suspend () -> Unit)? = null
 
     private val main = Handler(Looper.getMainLooper())
     private val manager = context.getSystemService(BluetoothManager::class.java)
@@ -121,11 +123,9 @@ class BleManager(
     private var detectedKind: BedProtocol? = null
     private var setupJob: Job? = null
 
-    private val opMutex = Mutex()
     private val frameMutex = Mutex()
-    private var pendingOp: PendingOp? = null
-
-    private class PendingOp(val kind: String, val uuid: UUID?, val deferred: CompletableDeferred<ByteArray>)
+    private val ops = GattOpQueue(log = { log.info("BLE", it) }, onTimeout = { linkBroken(it) })
+    private var stallJob: Job? = null
 
     private var bondWaiter: CompletableDeferred<Int>? = null
 
@@ -303,8 +303,7 @@ class BleManager(
     private fun cleanup(error: BedError?, notify: Boolean) {
         setupJob?.cancel()
         setupJob = null
-        pendingOp?.deferred?.completeExceptionally(error ?: BedError.NotConnected)
-        pendingOp = null
+        ops.reset(error ?: BedError.NotConnected)
         bondWaiter?.cancel()
         bondWaiter = null
         characteristics = emptyMap()
@@ -382,14 +381,7 @@ class BleManager(
     private fun complete(g: BluetoothGatt, kind: String, uuid: UUID?, status: Int, value: ByteArray) {
         main.post {
             if (g !== gatt) return@post
-            val op = pendingOp
-            if (op == null || op.kind != kind || (op.uuid != null && uuid != null && op.uuid != uuid)) {
-                log.info("BLE", "unexpected $kind callback (status $status) ignored")
-                return@post
-            }
-            pendingOp = null
-            if (status == BluetoothGatt.GATT_SUCCESS) op.deferred.complete(value)
-            else op.deferred.completeExceptionally(gattError(status))
+            ops.complete(kind, uuid?.toString(), value, if (status == BluetoothGatt.GATT_SUCCESS) null else gattError(status))
         }
     }
 
@@ -461,44 +453,44 @@ class BleManager(
      * caller still waits (at most [timeoutMs]) for the callback, so the operation queue never desyncs.
      * A missing callback drops the link (a late callback could otherwise complete the wrong operation).
      */
-    private suspend fun gattOp(kind: String, uuid: UUID?, timeoutMs: Long = 5_000, start: (BluetoothGatt) -> Boolean): ByteArray =
-        opMutex.withLock {
-            currentCoroutineContext().ensureActive()
-            val g = gatt ?: throw BedError.NotConnected
-            val deferred = CompletableDeferred<ByteArray>()
-            pendingOp = PendingOp(kind, uuid, deferred)
-            var started = false
-            for (attempt in 1..5) {
-                started = try { start(g) } catch (e: SecurityException) { throw BedError.Transport("Bluetooth permission missing") }
-                if (started) break
-                delay(25L * attempt) // the stack is momentarily busy (e.g. a system-initiated operation)
-            }
-            if (!started) {
-                if (pendingOp?.deferred === deferred) pendingOp = null
-                throw BedError.Transport("$kind could not be started")
-            }
-            val result = withContext(NonCancellable) {
-                withTimeoutOrNull(timeoutMs) { runCatching { deferred.await() } }
-            }
-            if (result == null) {
-                if (pendingOp?.deferred === deferred) pendingOp = null
-                linkBroken(kind, g)
-                throw BedError.Timeout("BLE $kind")
-            }
-            currentCoroutineContext().ensureActive()
-            result.getOrElse { throw (it as? BedError) ?: BedError.Transport(it.message ?: it.toString()) }
+    private suspend fun gattOp(kind: String, uuid: UUID?, timeoutMs: Long = 5_000, start: (BluetoothGatt) -> Boolean): ByteArray {
+        val g = gatt ?: throw BedError.NotConnected
+        return ops.run(kind, uuid?.toString(), timeoutMs) {
+            if (g !== gatt) throw BedError.NotConnected
+            try { start(g) } catch (e: SecurityException) { throw BedError.Transport("Bluetooth permission missing") }
         }
+    }
 
-    private fun linkBroken(kind: String, g: BluetoothGatt) {
+    /**
+     * An operation got no callback: the link is unreliable. Let the controller try a stop first (the
+     * timed-out key is poisoned, so its late callback cannot complete the stop's operations), and drop the
+     * link once that stop sequence has finished or failed (bounded).
+     */
+    private fun linkBroken(kind: String) {
+        val g = gatt ?: return
+        if (stallJob?.isActive == true) return
         log.error("BLE", "$kind confirmation timed out; sending stop, then dropping the link")
-        if (kind == "write") onWriteStall?.invoke()
-        main.postDelayed({
+        stallJob = scope.launch {
+            withTimeoutOrNull(STALL_STOP_BUDGET_MS) { runCatching { onLinkStall?.invoke() } }
             if (g === gatt) {
+                log.error("BLE", "dropping the stalled link")
                 closeGatt()
                 cleanup(BedError.Timeout("BLE $kind"), notify = true)
                 linkState = LinkState.Idle
             }
-        }, if (kind == "write") 1_500 else 0)
+        }
+    }
+
+    /** Unregisters receivers and closes the connection. The manager is unusable afterwards. */
+    fun close() {
+        stopScan()
+        disconnect()
+        runCatching { context.unregisterReceiver(receiver) }
+        onAdapterChange = null
+        onReady = null
+        onDisconnect = null
+        onNotification = null
+        onLinkStall = null
     }
 
     // MARK: BedLink
@@ -534,7 +526,9 @@ class BleManager(
         while (offset < frame.size) {
             val end = minOf(offset + chunkSize, frame.size)
             val chunk = frame.copyOfRange(offset, end)
-            gattOp("write", target.uuid) { g ->
+            // A with-response MCR write normally confirms within tens of ms; don't let a stall hold STOP up.
+            val timeout = if (withResponse && characteristic == BedCharacteristic.MCR_WRITE) MCR_WRITE_TIMEOUT_MS else 5_000L
+            gattOp("write", target.uuid, timeout) { g ->
                 if (Build.VERSION.SDK_INT >= 33) g.writeCharacteristic(target, chunk, writeType) == BluetoothStatusCodes.SUCCESS
                 else @Suppress("DEPRECATION") run {
                     target.writeType = writeType
@@ -564,6 +558,10 @@ class BleManager(
 
     companion object {
         const val MCR_CHUNK = 20
+        const val MCR_WRITE_TIMEOUT_MS = 1_500L
+
+        /** How long a stalled link stays open for the controller's stop sequence. */
+        const val STALL_STOP_BUDGET_MS = 6_000L
         private val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
         fun bondName(state: Int) = when (state) {

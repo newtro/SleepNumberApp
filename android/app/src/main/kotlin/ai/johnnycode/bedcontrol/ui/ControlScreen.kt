@@ -92,7 +92,6 @@ fun ControlScreen(controller: BedController, padding: PaddingValues, onFavorites
         ) {
             StatusCard(controller)
             controller.banner?.let { Banner(it) { controller.banner = null } }
-            controller.applyingFavorite?.let { FavoriteProgressCard(it, onCancel = controller::cancelFavorite) }
             val enabled = controller.isReady
             Box(Modifier.alpha(if (enabled) 1f else 0.55f)) {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -105,12 +104,20 @@ fun ControlScreen(controller: BedController, padding: PaddingValues, onFavorites
                 }
             }
         }
-        Surface(tonalElevation = 3.dp) {
+    }
+}
+
+/** STOP (always reachable) plus the running favorite's progress and Cancel; shown on every screen. */
+@Composable
+fun SafetyBar(controller: BedController) {
+    Surface(tonalElevation = 3.dp) {
+        Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            controller.applyingFavorite?.let { FavoriteProgressCard(it, onCancel = controller::cancelFavorite) }
             Button(
                 onClick = controller::stopEverything,
                 enabled = controller.isReady,
                 colors = ButtonDefaults.buttonColors(containerColor = StopRed, contentColor = Color.White),
-                modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(12.dp).heightIn(min = 56.dp)
+                modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)
                     .semantics { contentDescription = "STOP. Stops all bed movement and any firmness adjustment" },
             ) {
                 Text("STOP", fontSize = 22.sp, fontWeight = FontWeight.Black)
