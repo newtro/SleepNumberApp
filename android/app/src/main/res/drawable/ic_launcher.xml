@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Simple bed glyph on an indigo disc. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#3F51B5" android:pathData="M54,4a50,50 0,1 1,0 100a50,50 0,1 1,0 -100z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M26,40h6v16h44c3.3,0 6,2.7 6,6v14h-6v-6H32v6h-6z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M36,46h12c2.2,0 4,1.8 4,4v4H36z" />
+</vector>
