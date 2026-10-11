@@ -4,6 +4,7 @@ import ai.johnnycode.bedcontrol.BuildConfig
 import ai.johnnycode.bedcontrol.ble.AdapterState
 import ai.johnnycode.bedcontrol.ble.BleManager
 import ai.johnnycode.bedcontrol.ble.ScannedDevice
+import ai.johnnycode.bedkit.FirmnessDisplay
 import ai.johnnycode.bedkit.BedDetector
 import ai.johnnycode.bedkit.BedError
 import ai.johnnycode.bedkit.BedPreset
@@ -427,7 +428,8 @@ class BedController(app: Application) : AndroidViewModel(app) {
     }
 
     private fun apply(reading: BedReading, pollStarted: Long? = null) {
-        reading.firmness.forEach { (side, value) -> firmness[side] = value }
+        val shown = FirmnessDisplay.merge(firmness.toMap(), reading.firmness, reading.pumpBusy, adjustingSide)
+        shown.forEach { (side, value) -> firmness[side] = value }
         reading.pumpBusy?.let { busy ->
             pumpBusy = busy
             // The app waits 1 s after the bed acknowledges a set, then polls until idle. Only a poll that

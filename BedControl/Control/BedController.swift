@@ -378,9 +378,8 @@ final class BedController {
     }
 
     private func apply(_ reading: BedReading, pollStarted: Date? = nil) {
-        for (side, value) in reading.firmness {
-            firmness[side] = value
-        }
+        firmness = FirmnessDisplay.merge(current: firmness, reading: reading.firmness,
+                                         pumpBusy: reading.pumpBusy, adjustingSide: adjustingSide)
         if let busy = reading.pumpBusy {
             // An adjustment ends only on an idle reading from a poll that started >= 1 s after
             // the bed acknowledged the set (see FirmnessScheduler).
