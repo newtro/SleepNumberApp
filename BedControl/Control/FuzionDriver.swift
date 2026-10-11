@@ -132,8 +132,7 @@ final class FuzionDriver: BedDriver {
 
     func releaseHold(_ axis: FoundationAxis, side: BedSide) async -> BedReading? {
         // ACHA is the app's release; it halts every actuator, so it also stops the other side.
-        do { try await session.sendUrgent(.haltAllActuators()) } catch { log.error("Fuzion", "halt failed: \(error.localizedDescription)") }
-        try? await Task.sleep(for: .milliseconds(300))
+        await haltConfirmed()
         let wire = mapping().fuzionSide(for: side)
         guard let position = try? await session.actuatorPosition(wire, actuator: FuzionActuator(axis)) else { return nil }
         var reading = BedReading()
@@ -144,9 +143,30 @@ final class FuzionDriver: BedDriver {
 
     func stopAll() async throws {
         var firstError: Error?
-        do { try await session.sendUrgent(.haltAllActuators()) } catch { firstError = error }
-        do { try await session.sendUrgent(.interruptSleepNumberAdjustment()) } catch { firstError = firstError ?? error }
+        do { try await session.sendUrgent(.interruptSleepNumberAdjustment()) } catch { firstError = error }
+        await haltConfirmed()
         if let firstError { throw firstError }
+    }
+
+    /// ACHA written immediately, then through the queue until PASS, then re-sent while ACTM
+    /// still reports movement (the app sends ACHA through its mutex; this does both).
+    private func haltConfirmed() async {
+        do { try await session.sendUrgent(.haltAllActuators()) } catch { log.error("Fuzion", "urgent halt failed: \(error.localizedDescription)") }
+        for attempt in 1...3 {
+            do {
+                try await session.send(.haltAllActuators(), isStop: true)
+                try? await Task.sleep(for: .milliseconds(300))
+                let movement = try FuzionMovementStatus.parse(try await session.send(.actuatorMovementStatus(), isStop: true))
+                if !movement.any { return }
+                log.error("Fuzion", "still moving after halt attempt \(attempt)")
+            } catch {
+                log.error("Fuzion", "halt attempt \(attempt) failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func favoriteOps(for side: BedSide) -> FavoriteBedOps {
+        FuzionFavoriteOps(session: session, side: mapping().fuzionSide(for: side))
     }
 
     func handleNotification(_ characteristic: BedCharacteristic, _ data: Data) {

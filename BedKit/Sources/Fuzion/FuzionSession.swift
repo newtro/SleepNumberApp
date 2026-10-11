@@ -47,6 +47,7 @@ public final class FuzionSession {
     // MARK: Authentication
 
     /// Reads Auth (which makes iOS pair if the bed demands encryption) and validates the session.
+    @discardableResult
     public func authenticate() async throws -> Data {
         guard let link else { throw BedError.notConnected }
         var lastError: Error = BedError.timeout("Auth read")
@@ -99,12 +100,13 @@ public final class FuzionSession {
 
     /// Sends one command and returns its PASS argument tokens.
     @discardableResult
-    public func send(_ command: FuzionCommand, generation: UInt64? = nil) async throws -> [String] {
+    /// - Parameter isStop: halts (ACHA, PSNI) are never dropped by the stop generation check.
+    public func send(_ command: FuzionCommand, generation: UInt64? = nil, isStop: Bool = false) async throws -> [String] {
         let generation = generation ?? stopGeneration
         await mutex.lock()
         defer { mutex.unlock() }
         try Task.checkCancellation()
-        guard generation == stopGeneration else {
+        guard generation == stopGeneration || isStop else {
             log(FrameEvent(.info, channel: "BamKey", text: "dropped \(command.key): STOP was pressed after it was queued"))
             throw BedError.cancelled
         }

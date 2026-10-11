@@ -59,7 +59,13 @@ final class MCRDriver: BedDriver {
         let map = mapping()
         for side in BedSide.allCases { reading.firmness[side] = pump.sleepNumber(map.mcrSide(for: side)) }
         reading.pumpBusy = pump.busy
-        apply(try await session.readFoundationStatus(), to: &reading)
+        do {
+            apply(try await session.readFoundationStatus(), to: &reading)
+        } catch BedError.malformedResponse(let why) {
+            // Keep the pump result (the firmness queue depends on it) even if the foundation
+            // reply is unusable, e.g. out-of-range positions while homing.
+            log.error("MCR", "foundation status unusable: \(why)")
+        }
         if includeLight && hasUnderBedLight {
             do { reading.lightOn = try await session.readUnderBedLight().on } catch { log.info("MCR", "light read failed: \(error.localizedDescription)") }
         }
@@ -133,22 +139,40 @@ final class MCRDriver: BedDriver {
     }
 
     func releaseHold(_ axis: FoundationAxis, side: BedSide) async -> BedReading? {
-        do {
-            try await session.stopFoundation(sides: [mapping().mcrSide(for: side)])
-        } catch {
-            log.error("MCR", "stop failed: \(error.localizedDescription)")
-        }
-        guard let status = try? await session.readFoundationStatus() else { return nil }
-        var reading = BedReading()
-        apply(status, to: &reading)
-        return reading
+        await stopConfirmed(sides: [mapping().mcrSide(for: side)])
     }
 
     func stopAll() async throws {
         var firstError: Error?
-        do { try await session.stopFoundation() } catch { firstError = error }
-        do { try await session.stopPump() } catch { firstError = firstError ?? error }
+        do { try await session.stopPump() } catch { firstError = error }
+        _ = await stopConfirmed(sides: MCRWireSide.allCases)
         if let firstError { throw firstError }
+    }
+
+    /// Sends the stop key, then checks the foundation; re-sends while it still reports motion.
+    @discardableResult
+    private func stopConfirmed(sides: [MCRWireSide]) async -> BedReading? {
+        var last: MCRFoundationStatus?
+        for attempt in 1...3 {
+            do {
+                try await session.stopFoundation(sides: sides)
+            } catch {
+                log.error("MCR", "stop attempt \(attempt) failed: \(error.localizedDescription)")
+            }
+            try? await Task.sleep(for: .milliseconds(300))
+            last = try? await session.send(try MCRCommands.readFoundationStatus(), generation: session.stopGeneration)
+                .flatMapStatus()
+            if let last, !last.moving { break }
+            log.error("MCR", "foundation still moving after stop attempt \(attempt)")
+        }
+        guard let last else { return nil }
+        var reading = BedReading()
+        apply(last, to: &reading)
+        return reading
+    }
+
+    func favoriteOps(for side: BedSide) -> FavoriteBedOps {
+        MCRFavoriteOps(session: session, side: mapping().mcrSide(for: side))
     }
 
     func handleNotification(_ characteristic: BedCharacteristic, _ data: Data) {
@@ -170,4 +194,8 @@ final class MCRDriver: BedDriver {
         }
         reading.moving = status.moving
     }
+}
+
+private extension MCRFrame {
+    func flatMapStatus() throws -> MCRFoundationStatus { try MCRFoundationStatus.parse(self) }
 }

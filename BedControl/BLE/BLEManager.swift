@@ -39,6 +39,9 @@ final class BLEManager: NSObject, GATTLink {
     @ObservationIgnored var onNotification: ((BedCharacteristic, Data) -> Void)?
     /// Tells BamKey notifications ("response ready" hints) apart from read results.
     @ObservationIgnored var isFuzionHint: ((Data) -> Bool)?
+    /// Called when a write stalls, just before the link is dropped, so the controller can try
+    /// to get a stop out first.
+    @ObservationIgnored var onWriteStall: (() -> Void)?
 
     @ObservationIgnored private let log: DiagnosticsLog
     @ObservationIgnored private var central: CBCentralManager!
@@ -194,8 +197,13 @@ final class BLEManager: NSObject, GATTLink {
                             self.pendingWrite = nil
                             waiting.resume(throwing: BedError.timeout("BLE write"))
                             // A late confirmation could complete the wrong write; treat the link as broken.
-                            self.log.error("BLE", "write confirmation timed out; dropping the link")
-                            if let current = self.peripheral { self.central.cancelPeripheralConnection(current) }
+                            self.log.error("BLE", "write confirmation timed out; sending stop, then dropping the link")
+                            self.onWriteStall?()
+                            let stalled = self.peripheral
+                            Task { @MainActor in
+                                try? await Task.sleep(for: .seconds(1.5))
+                                if let stalled, stalled === self.peripheral { self.central.cancelPeripheralConnection(stalled) }
+                            }
                         }
                     }
                 }
@@ -439,6 +447,11 @@ extension BLEManager: CBPeripheralDelegate {
             guard peripheral === self.peripheral, let id = identify(characteristic) else { return }
             if let error {
                 let mapped = BLEManager.mapError(error)
+                if let orphans = orphanedReads[id], orphans > 0 {
+                    orphanedReads[id] = orphans - 1
+                    log.info(id.rawValue, "discarded late read error from an abandoned read")
+                    return
+                }
                 if let waiter = pendingReads[id]?.first {
                     pendingReads[id]?.removeFirst()
                     waiter.resume(throwing: mapped)

@@ -141,7 +141,8 @@ public final class MCRSession {
               frame.functionCode == request.function,
               frame.command & 0xF0 == request.node.rawValue & 0xF0 else { return false }
         if frame.destination == 0 { return true }
-        return frame.destination == bind.clientAddress && frame.sourceEcho == bind.bedAddress
+        let fromBed = frame.sourceEcho == bind.bedAddress || (bind.bedAddressFromMAC && frame.sourceEcho == 0)
+        return frame.destination == bind.clientAddress && fromBed
     }
 
     /// Writes a request immediately, bypassing the request queue and without waiting for a
@@ -160,7 +161,7 @@ public final class MCRSession {
         await mutex.lock()
         defer { mutex.unlock() }
         try Task.checkCancellation()
-        if let generation, generation != stopGeneration {
+        if let generation, generation != stopGeneration, !request.isStop {
             log(FrameEvent(.info, channel: "MCR", text: "dropped \(request.label): STOP was pressed after it was queued"))
             throw BedError.cancelled
         }

@@ -74,6 +74,8 @@ protocol BedDriver: AnyObject {
     func releaseHold(_ axis: FoundationAxis, side: BedSide) async -> BedReading?
     /// Stops all motion and any pump adjustment immediately, abandoning queued commands.
     func stopAll() async throws
+    /// Operations for applying a saved favorite on one side.
+    func favoriteOps(for side: BedSide) -> FavoriteBedOps
     func handleNotification(_ characteristic: BedCharacteristic, _ data: Data)
     func reset()
 }

@@ -17,15 +17,20 @@ public struct MCRBindResult: Equatable, Sendable {
     public var bedAddress: UInt16
     /// Our assigned address: reply payload bytes 8-9. Goes in the source fields.
     public var clientAddress: UInt16
+    /// True when the bed address came from the MAC because the reply's source was 0.
+    public var bedAddressFromMAC = false
 
     /// `macFallback` (last two MAC octets) is used only if the reply's source field is zero.
     public static func parse(_ reply: MCRFrame, macFallback: UInt16? = nil) throws -> MCRBindResult {
         let client: UInt16 = reply.payload.count >= 10
             ? UInt16(reply.payload[8]) << 8 | UInt16(reply.payload[9]) : 0
-        guard let bed = [reply.source, macFallback ?? 0].first(where: { $0 != 0 }) else {
+        if reply.source != 0 {
+            return MCRBindResult(bedAddress: reply.source, clientAddress: client)
+        }
+        guard let mac = macFallback, mac != 0 else {
             throw BedError.malformedResponse("bind reply carried no bed address")
         }
-        return MCRBindResult(bedAddress: bed, clientAddress: client)
+        return MCRBindResult(bedAddress: mac, clientAddress: client, bedAddressFromMAC: true)
     }
 }
 

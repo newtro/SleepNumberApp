@@ -40,8 +40,10 @@ public struct MCRRequest: Equatable, Sendable, CustomStringConvertible {
     public let side: UInt8
     public let payload: [UInt8]
     public let label: String
+    /// Stop frames are never dropped by the session's stop generation check.
+    public let isStop: Bool
 
-    init(node: MCRNode, function: UInt8, side: UInt8, payload: [UInt8] = [], label: String) throws {
+    init(node: MCRNode, function: UInt8, side: UInt8, payload: [UInt8] = [], label: String, isStop: Bool = false) throws {
         guard side <= 0x0F, payload.count <= MCRFrame.maxPayload else {
             throw BedError.invalidArgument("MCR side/payload out of range")
         }
@@ -50,6 +52,7 @@ public struct MCRRequest: Equatable, Sendable, CustomStringConvertible {
         self.side = side
         self.payload = payload
         self.label = label
+        self.isStop = isStop
         try MCRSafety.validate(self)
     }
 
@@ -123,7 +126,7 @@ public enum MCRCommands {
 
     /// Interrupts a firmness adjustment in progress (`ForceIdleCall`).
     public static func pumpForceIdle() throws -> MCRRequest {
-        try MCRRequest(node: .pump, function: MCRFunction.forceIdle, side: 0, label: "Pump idle")
+        try MCRRequest(node: .pump, function: MCRFunction.forceIdle, side: 0, label: "Pump idle", isStop: true)
     }
 
     /// Starts a firmness adjustment on one side (`SetSleepNumberCall`).
@@ -162,14 +165,14 @@ public enum MCRCommands {
     }
 
     /// Sleep Expert short write: key (4 ASCII) + value, node 0x52 cmd 0x1B.
-    static func sleepExpertWrite(key: String, value: String, label: String) throws -> MCRRequest {
+    static func sleepExpertWrite(key: String, value: String, label: String, isStop: Bool = false) throws -> MCRRequest {
         let keyBytes = Array(key.utf8)
         let valueBytes = Array(value.utf8)
         guard keyBytes.count == 4, keyBytes.count + valueBytes.count <= MCRFrame.maxPayload else {
             throw BedError.invalidArgument("Sleep Expert key must be 4 bytes and fit 15 with its value")
         }
         return try MCRRequest(node: .sleepExpert, function: MCRFunction.seShortWrite, side: 0,
-                              payload: keyBytes + valueBytes, label: label)
+                              payload: keyBytes + valueBytes, label: label, isStop: isStop)
     }
 
     /// Side letter in Sleep Expert keys: R for side 0 (right), L for side 1 (left).
@@ -178,7 +181,7 @@ public enum MCRCommands {
     /// Stops foundation movement on one side (`StopFoundationMovementCall`): MFHR/MFHL = "110".
     public static func stopMotion(side: MCRWireSide) throws -> MCRRequest {
         let key = "MFH" + keyLetter(side)
-        return try sleepExpertWrite(key: key, value: "110", label: "Stop \(key)")
+        return try sleepExpertWrite(key: key, value: "110", label: "Stop \(key)", isStop: true)
     }
 
     /// Absolute position (`SetFoundationPositionCall`): MFU*/MFF* = "<pos>_0".
